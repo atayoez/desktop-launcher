@@ -111,8 +111,10 @@ make enable
 ```
 
 A freshly installed extension is only picked up by GNOME Shell on login, so
-log out and back in the first time. `make zip` builds an installable
-`desktop-launcher@oezcan.me.shell-extension.zip`.
+log out and back in the first time. `make zip` builds
+`desktop-launcher@oezcan.me.shell-extension.zip` with `gnome-extensions pack`,
+installable with `gnome-extensions install <zip>` and the file to upload to
+extensions.gnome.org. Release zips are attached to the GitHub releases.
 
 Desktop-icon extensions such as Desktop Icons NG (DING) put a full-screen
 window on the desktop layer that would cover the launcher. Disable them.
@@ -139,3 +141,7 @@ gdbus call --session --dest org.gnome.Shell.Screenshot --object-path /org/gnome/
 ```
 
 Top-level `await` is not allowed in Eval; return a promise instead.
+
+## License
+
+GPL-2.0-or-later, see [LICENSE](LICENSE).

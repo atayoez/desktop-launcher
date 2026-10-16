@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Atay Özcan <atay@oezcan.me>
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Desktop Launcher preferences window.
 
 import Adw from 'gi://Adw';

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Atay Özcan <atay@oezcan.me>
+// SPDX-License-Identifier: GPL-2.0-or-later
+
 // Desktop Launcher: the empty desktop *is* the app launcher.
 //
 // One LauncherLayer per monitor is added to the Shell's background group

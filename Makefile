@@ -23,8 +23,13 @@ install: zip
 uninstall:
 	gnome-extensions uninstall $(UUID) || rm -rf $(TARGET)
 
-zip: schemas
-	cd $(SRC) && zip -r ../$(UUID).shell-extension.zip . -x '*.compiled' -x '*~'
+# Build the zip for extensions.gnome.org / `gnome-extensions install`.
+# `pack` includes extension.js, prefs.js, metadata.json and stylesheet.css
+# and compiles the schema itself, so gschemas.compiled is not shipped.
+zip:
+	gnome-extensions pack --force --out-dir=$(CURDIR) \
+		--schema=$(SRC)/schemas/org.gnome.shell.extensions.desktop-launcher.gschema.xml \
+		$(SRC)
 
 enable:
 	gnome-extensions enable $(UUID)

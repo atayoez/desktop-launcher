@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Atay Özcan <atay@oezcan.me>
+# SPDX-License-Identifier: GPL-2.0-or-later
 # Start a headless GNOME Shell (virtual monitor, no window) with only Desktop
 # Launcher enabled, for testing over D-Bus (org.gnome.Shell.Eval and
 # org.gnome.Shell.Screenshot). Pass "devkit" as $2 for a visible window.
