@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="desktop-launcher">
+  <schema id="org.gnome.shell.extensions.desktop-launcher"
+          path="/org/gnome/shell/extensions/desktop-launcher/">
+    <key name="icon-size" type="i">
+      <range min="32" max="160"/>
+      <default>64</default>
+      <summary>Icon size</summary>
+      <description>Size of the app icons on the desktop, in pixels.</description>
+    </key>
+    <key name="show-labels" type="b">
+      <default>true</default>
+      <summary>Show app names</summary>
+    </key>
+    <key name="show-favorites" type="b">
+      <default>true</default>
+      <summary>Show a favourites section</summary>
+      <description>Shows the dash favourites as a separate row above all apps.</description>
+    </key>
+    <key name="show-section-titles" type="b">
+      <default>true</default>
+      <summary>Show section titles</summary>
+    </key>
+    <key name="replace-app-grid" type="b">
+      <default>false</default>
+      <summary>Replace GNOME's app grid with the desktop</summary>
+      <description>The Show Apps button (GNOME dash or Dash to Panel) and Super+A reveal the desktop launcher by minimizing all windows with GNOME's animation, instead of opening the overview app grid. Pressing again restores the windows. Swiping or scrolling to the app grid page in the overview is disabled.</description>
+    </key>
+    <key name="app-order" type="as">
+      <default>[]</default>
+      <summary>Order of the All Apps grid</summary>
+      <description>Desktop file ids and "folder:ID" entries in display order, written when tiles are dragged. Items not listed are appended in default order.</description>
+    </key>
+    <key name="all-monitors" type="b">
+      <default>false</default>
+      <summary>Show the launcher on every monitor</summary>
+      <description>When off, only the primary monitor gets a launcher.</description>
+    </key>
+    <key name="margin" type="i">
+      <range min="0" max="400"/>
+      <default>48</default>
+      <summary>Outer margin</summary>
+      <description>Space between the launcher grid and the edge of the work area, in pixels.</description>
+    </key>
+    <key name="max-width" type="i">
+      <range min="0" max="6000"/>
+      <default>0</default>
+      <summary>Maximum grid width</summary>
+      <description>Limits how wide the grid can grow, in pixels; the grid is centred. 0 means no limit.</description>
+    </key>
+  </schema>
+</schemalist>

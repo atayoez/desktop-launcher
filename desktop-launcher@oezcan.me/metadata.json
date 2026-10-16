@@ -1,0 +1,10 @@
+{
+  "uuid": "desktop-launcher@oezcan.me",
+  "name": "Desktop Launcher",
+  "description": "Turns the empty desktop into a permanent app launcher: a grid of your favourite and installed apps lives on the wallpaper, behind every window, like a phone home screen. Click to launch, right-click for the app menu. Replaces desktop icons, not the overview.",
+  "url": "https://github.com/atayoez/desktop-launcher",
+  "shell-version": ["48", "49", "50", "51"],
+  "session-modes": ["user"],
+  "settings-schema": "org.gnome.shell.extensions.desktop-launcher",
+  "version": 1
+}
