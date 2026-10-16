@@ -1017,7 +1017,9 @@ export default class DesktopLauncherExtension extends Extension {
         // A drag on one monitor's grid saves app-order; the layer that did
         // the drag already shows it, other layers rebuild.
         this._settings.connectObject('changed::app-order', () => {
-            this._layers.filter(l => !l.matchesSavedOrder()).forEach(l => l.rebuild());
+            const reset = this._settings.get_strv('app-order').length === 0;
+            this._layers.filter(l => reset || !l.matchesSavedOrder())
+                .forEach(l => l.rebuild());
         }, this);
         for (const key of ['icon-size', 'show-labels', 'margin', 'max-width']) {
             this._settings.connectObject(`changed::${key}`, () => {

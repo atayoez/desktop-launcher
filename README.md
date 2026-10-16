@@ -1,138 +1,117 @@
+<div align="center">
+
+<img src="docs/icon.svg" width="128" alt="Desktop Launcher icon: app tiles on a blue-green wallpaper with a cursor">
+
 # Desktop Launcher
 
-A GNOME Shell extension that turns the empty desktop into a permanent app
-launcher. A grid of your favourite and installed apps lives on the wallpaper,
-behind every window, like a phone home screen. Nothing changes about the
-overview, the dash or Alt+Tab; the launcher simply fills the space that an
-empty desktop would otherwise waste.
+**Your empty desktop is the app launcher.**
 
-- Click an icon to launch (or focus) the app. Middle-click / Ctrl-click opens
-  a new window.
-- Right-click or long-press for the Shell's own app menu, identical to the
-  overview app grid: Open Windows, New Window, the app's desktop actions,
-  Launch using Discrete Graphics (where applicable), Pin to / Unpin from Dash,
-  App Details, Quit.
-- Apps the dock already shows, pinned favourites and running apps, stay out
-  of All Apps and folders; they come back when unpinned or closed.
-- Drag tiles to reorder. All Apps keeps its own order (new apps are appended);
-  dragging in the Favourites row reorders GNOME's favourites, and dragging an
-  app from All Apps onto the Favourites row pins it at that spot.
-- GNOME's app folders (the ones you make in the overview) appear as folder
-  tiles ahead of the loose apps. Clicking one opens a panel over the grid with
-  its apps (the rest of the grid stays undimmed); click outside or launch an app to close it. Folder changes made in
-  the overview show up immediately.
-- A dot under an icon marks a running app.
-- Scroll to reach apps that don't fit on screen.
-- Right-click on empty wallpaper still opens GNOME's background menu.
-- Optional: **Replace GNOME's app grid.** The Show Apps button (GNOME dash or
-  Dash to Panel) and Super+A then minimize every window on the current
-  workspace with GNOME's own minimize animation, revealing the launcher.
-  Pressing again restores exactly those windows. The overview can no longer
-  swipe or scroll to the app grid page.
+A GNOME Shell extension that draws your apps on the wallpaper, behind every window, like a phone home screen. Click to launch, right-click for GNOME's app menu, open folders, drag to reorder. The overview, the dash and Alt+Tab stay exactly as they are.
 
-Tested on GNOME Shell 50 (Fedora 44, Wayland).
+[![Latest release](https://img.shields.io/github/v/release/atayoez/desktop-launcher?label=release&color=3b7dd8)](https://github.com/atayoez/desktop-launcher/releases/latest)
+![GNOME 48–51](https://img.shields.io/badge/GNOME-48%20%E2%80%93%2051-4a86cf?logo=gnome&logoColor=white)
+![Wayland](https://img.shields.io/badge/Wayland-ready-333?logo=wayland&logoColor=white)
+![GJS](https://img.shields.io/badge/GJS-ESM-f7df1e?logo=javascript&logoColor=black)
+[![License: GPL-2.0-or-later](https://img.shields.io/badge/license-GPL--2.0--or--later-blue)](LICENSE)
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&logoColor=white)](https://paypal.me/atayozc)
 
-## How it works
+<img src="docs/screenshots/desktop.png" width="800" alt="A GNOME desktop whose wallpaper carries a Favourites row and an All Apps grid of app icons and two folders">
 
-The Shell keeps its wallpaper actors in a `Meta.BackgroundGroup` at the very
-bottom of `global.window_group`. The extension adds one `LauncherLayer` per
-monitor to that group, sized to the monitor's work area. Being inside the
-window group means the layer is above the wallpaper and below all windows,
-and the overview (which draws its own backgrounds) never shows it.
+</div>
 
-Tiles are `St.Button`s around the Shell's own `IconGrid.BaseIcon`, so icons
-and the hover/focus look come from the running Shell theme; the context menu
-is the Shell's `AppMenu`. When the Shell recreates a wallpaper actor (wallpaper
-change, monitor hot-plug) it lands on top of the layer, so the extension
-listens to `child-added` on the group and moves itself back up.
+## Features
 
-### Replacing the app grid
+| | |
+|---|---|
+| **Lives on the wallpaper** | The grid sits between the wallpaper and your windows. Wherever there is no window, there is your launcher; windows simply cover it. Nothing changes in the overview. |
+| **Click, right-click, long-press** | Click launches or focuses an app, middle-click or Ctrl-click opens a new window. Right-click or long-press opens GNOME's own app menu: open windows, New Window, desktop actions, Pin to Dash, App Details, Quit. |
+| **Folders** | Your GNOME app folders show up as folder tiles. Click one and its apps open in a panel over the grid; click outside or launch something to close it. Changes made in the overview appear immediately. |
+| **Drag to reorder** | Press and hold, then drag. All Apps keeps your order, dragging in the Favourites row reorders GNOME's favourites, and dropping an app on the Favourites row pins it. |
+| **No duplicates with the dock** | Pinned and running apps are already in the dock, so they stay out of All Apps and folders until unpinned or closed. |
+| **Replace GNOME's app grid** | Optional: the Show Apps button, in the GNOME dash or in Dash to Panel, and Super+A minimize every window with GNOME's animation to reveal the launcher. Press again and the windows come back. |
+| **Theme-native** | Tiles reuse the Shell's own icon and menu classes, so they follow your Shell theme, accent colour and icon theme. Running apps get a dot. |
 
-With `replace-app-grid` on, every path into the overview's app grid is
-redirected to `toggleDesktop()`: `Overview.show(APP_GRID)` (which is also
-what Dash to Panel calls), `Overview.showApps()`, the `toggle-application-view`
-keybinding, and the dash's Show Apps toggle (its handler is swapped for ours,
-so the button acts as a momentary button). The overview state adjustment is
-clamped to the window picker so `shift-overview-up` and the swipe gesture
-can't reach the grid either. `toggleDesktop()` minimizes the normal and dialog
-windows of the active workspace in stacking order, or, if the previous call
-minimized windows that are still minimized, unminimizes them and focuses the
-topmost. Dash to Panel triggers both the dash button and `show(APP_GRID)` for
-a single click, so triggers within 300 ms are treated as one.
-
-### Reordering
-
-Tiles are Shell DND sources (`DND.makeDraggable`, press-and-hold or move)
-and each section's grid is a drop target. While a tile is dragged over its
-own section the faded source tile acts as the placeholder and the grid
-re-attaches its children live; the drop writes the order to `app-order`
-(desktop ids and `folder:ID`), or for the Favourites row calls
-`AppFavorites.moveFavoriteToPos`. A drop of an All Apps tile on the
-Favourites row calls `addFavoriteAtPos`. The whole section row, not just the
-grid, maps drops to the nearest slot so dropping after the last tile works.
-
-### Folders
-
-Folders are read from `org.gnome.desktop.app-folders`, resolved like the
-overview does (explicit `apps`, plus apps whose categories intersect the
-folder's `categories`, minus `excluded-apps`; empty folders are skipped) and
-the extension watches each folder's settings for changes. The folder popup
-lives inside the launcher layer, so it stays behind windows like the rest.
-
-Two Clutter gotchas worth knowing if you touch the tiles: a right-click
-gesture on an `St.Button` must set `recognize_on_press`, because the button's
-own click gesture claims the release; and a plain signal handler that returns
-`EVENT_STOP` for a press makes Clutter cancel every gesture still deciding,
-so the folder backdrop checks the pointer position instead of stopping events
-on the panel.
-
-## Settings
-
-Open with `gnome-extensions prefs desktop-launcher@oezcan.me` or from the
-Extensions app.
-
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `icon-size` | 64 | Icon size in pixels |
-| `show-labels` | true | App names under the icons |
-| `show-section-titles` | true | "Favourites" / "All Apps" headings (hidden automatically when only one section is shown) |
-| `show-favorites` | true | Dash favourites as their own row |
-| `margin` | 48 | Space between grid and work-area edge |
-| `max-width` | 0 | Cap the grid width (0 = none); grid is centred |
-| `all-monitors` | false | One launcher per monitor instead of primary only |
-| `app-order` | [] | Saved drag order of All Apps (written by the extension) |
-| `replace-app-grid` | false | Show Apps button / Super+A reveal the desktop instead of the overview app grid |
+<div align="center">
+<table>
+<tr>
+<td><img src="docs/screenshots/folder.png" width="400" alt="The Utilities folder open as a dark rounded panel over the grid, showing its five apps"></td>
+<td><img src="docs/screenshots/menu.png" width="400" alt="GNOME's app menu opened by right-clicking a tile: New Window, Pin to Dash, App Details"></td>
+</tr>
+<tr>
+<td align="center"><sub>Folders</sub></td>
+<td align="center"><sub>Right-click menu</sub></td>
+</tr>
+<tr>
+<td><img src="docs/screenshots/drag.png" width="400" alt="A tile being dragged between two folders; the other tiles have moved aside"></td>
+<td><img src="docs/screenshots/windows.png" width="400" alt="Calculator and Clocks windows open on top of the launcher grid"></td>
+</tr>
+<tr>
+<td align="center"><sub>Drag to reorder</sub></td>
+<td align="center"><sub>Behind every window</sub></td>
+</tr>
+</table>
+</div>
 
 ## Install
 
-```bash
-make link      # symlink the source into ~/.local/share/gnome-shell/extensions
-make enable
+**From the release zip.** Download `desktop-launcher@oezcan.me.shell-extension.zip` from the [latest release](https://github.com/atayoez/desktop-launcher/releases/latest), then:
+
+```sh
+gnome-extensions install desktop-launcher@oezcan.me.shell-extension.zip
+gnome-extensions enable desktop-launcher@oezcan.me
 ```
 
-A freshly installed extension is only picked up by GNOME Shell on login, so
-log out and back in the first time. `make zip` builds
-`desktop-launcher@oezcan.me.shell-extension.zip` with `gnome-extensions pack`,
-installable with `gnome-extensions install <zip>` and the file to upload to
-extensions.gnome.org. Release zips are attached to the GitHub releases.
+**From source.** Symlinks the checkout into your extensions folder, handy for hacking on it:
 
-Desktop-icon extensions such as Desktop Icons NG (DING) put a full-screen
-window on the desktop layer that would cover the launcher. Disable them.
+```sh
+git clone https://github.com/atayoez/desktop-launcher.git
+cd desktop-launcher
+make link enable
+```
+
+GNOME Shell only picks up a newly installed extension at login, so log out and back in once. Works on GNOME Shell 48 to 51 (developed and tested on 50, Fedora 44, Wayland).
+
+Desktop-icon extensions such as Desktop Icons NG put a full-screen window on the desktop layer that would cover the launcher. Turn them off.
+
+## Settings
+
+Open with `gnome-extensions prefs desktop-launcher@oezcan.me` or from the Extensions app.
+
+| Setting | Default | What it does |
+|---|---|---|
+| Icon size | 64 px | Size of the app icons |
+| Show app names | on | Labels under the icons |
+| Show section titles | on | "Favourites" and "All Apps" headings; hidden automatically when there is only one section |
+| Favourites row | on | Dash favourites as a row above All Apps |
+| Replace GNOME's app grid | off | Show Apps button and Super+A reveal the desktop instead of opening the overview grid |
+| Outer margin | 48 px | Space between the grid and the edge of the work area |
+| Maximum grid width | unlimited | Cap the grid width; the grid is centred |
+| Show on every monitor | off | One launcher per monitor instead of the primary only |
+
+The drag order of All Apps is stored in the `app-order` key and never needs touching by hand.
+
+## How it works
+
+The Shell keeps its wallpaper actors in a `Meta.BackgroundGroup` at the bottom of `global.window_group`. The extension adds one `LauncherLayer` per monitor to that group, sized to the monitor's work area. Being inside the window group puts the layer above the wallpaper and below all windows, and the overview, which draws its own backgrounds, never shows it. When the Shell recreates a wallpaper actor (wallpaper change, monitor hot-plug) it lands on top of the layer, so the extension listens for `child-added` on the group and moves itself back up.
+
+Tiles are `St.Button`s around the Shell's `IconGrid.BaseIcon`; the context menu is the Shell's `AppMenu`. Folders are read from `org.gnome.desktop.app-folders` and resolved like the overview does: explicit `apps`, plus apps whose categories intersect the folder's `categories`, minus `excluded-apps`.
+
+**Reordering.** Tiles are Shell DND sources and each section's grid is a drop target. While a tile is dragged over its own section the faded source tile acts as the placeholder and the grid re-attaches its children live. The drop writes `app-order`, or for the Favourites row calls `AppFavorites.moveFavoriteToPos`; dropping an All Apps tile on the Favourites row calls `addFavoriteAtPos`.
+
+**Replacing the app grid.** Every way into the overview's app grid is redirected to `toggleDesktop()`: `Overview.show(APP_GRID)` (which is also what Dash to Panel calls), `Overview.showApps()`, the `toggle-application-view` keybinding and the dash's Show Apps toggle. The overview state is clamped to the window picker so the swipe gesture can't reach the grid either. `toggleDesktop()` minimizes the windows of the active workspace in stacking order, or restores the ones it minimized. Everything is undone when the option or the extension is turned off.
 
 ## Develop and test
 
 Wayland can't restart the Shell, so test in a throw-away headless Shell:
 
-```bash
-make nested          # headless Shell with a 1600x900 virtual monitor
-./scripts/nested.sh 1920x1080 devkit   # or a visible window
+```sh
+make nested                             # headless Shell with a 1600x900 virtual monitor
+./scripts/nested.sh 1920x1080 devkit    # or a visible window
 ```
 
-The script uses its own settings file and enables a tiny helper extension
-that puts *that* Shell in unsafe mode, which unlocks `org.gnome.Shell.Eval`
-and `org.gnome.Shell.Screenshot` on its bus (`$XDG_RUNTIME_DIR/desktop-launcher-nested/bus`):
+The script uses its own settings file and enables a tiny helper extension that puts *that* Shell in unsafe mode, which unlocks `org.gnome.Shell.Eval` and `org.gnome.Shell.Screenshot` on its bus:
 
-```bash
+```sh
 export DBUS_SESSION_BUS_ADDRESS=$(cat $XDG_RUNTIME_DIR/desktop-launcher-nested/bus)
 gdbus call --session --dest org.gnome.Shell --object-path /org/gnome/Shell \
   --method org.gnome.Shell.Eval "import('resource:///org/gnome/shell/ui/main.js').then(Main => Main.overview.hide())"
@@ -140,8 +119,18 @@ gdbus call --session --dest org.gnome.Shell.Screenshot --object-path /org/gnome/
   --method org.gnome.Shell.Screenshot.Screenshot false false /tmp/shot.png
 ```
 
-Top-level `await` is not allowed in Eval; return a promise instead.
+Top-level `await` is not allowed in Eval; return a promise instead. Real clicks can be injected with a virtual pointer created from Eval (`seat.create_virtual_device`), which is how the screenshots above were taken. `make zip` builds the release archive with `gnome-extensions pack`.
+
+Two Clutter gotchas if you touch the tiles: a right-click gesture on an `St.Button` must set `recognize_on_press`, because the button's own click gesture claims the release; and a signal handler that returns `EVENT_STOP` for a press makes Clutter cancel every gesture still deciding, so the folder backdrop checks the pointer position instead of stopping events.
+
+## Support
+
+Desktop Launcher is free and always will be. If it makes your desktop feel like home, you can support its development:
+
+[![Donate with PayPal](https://img.shields.io/badge/Donate-PayPal-00457C?logo=paypal&logoColor=white&style=for-the-badge)](https://paypal.me/atayozc)
+
+Bug reports and ideas are welcome in [Issues](https://github.com/atayoez/desktop-launcher/issues).
 
 ## License
 
-GPL-2.0-or-later, see [LICENSE](LICENSE).
+GPL-2.0-or-later. See [`LICENSE`](LICENSE).
