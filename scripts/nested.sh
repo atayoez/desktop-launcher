@@ -25,6 +25,7 @@ export XDG_CONFIG_HOME="$STATE/config"
 export XDG_DATA_DIRS="$STATE/data:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 export GSETTINGS_BACKEND=keyfile
 gsettings set org.gnome.shell enabled-extensions "['$UUID', '$DEV']"
+gsettings set org.gnome.shell disabled-extensions "[]"
 gsettings set org.gnome.shell disable-user-extensions false
 gsettings set org.gnome.shell welcome-dialog-last-shown-version '999'
 exec dbus-run-session -- sh -c "
