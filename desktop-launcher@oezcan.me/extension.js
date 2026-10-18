@@ -1098,6 +1098,8 @@ class LauncherMirror {
             if (!holder.get_stage() || !layer.get_stage() ||
                 !holder.has_allocation() || !ref.has_allocation())
                 return;
+            if (!clone.get_parent())
+                return;
             const [rw, rh] = [ref.width, ref.height];
             if (rw <= 0 || rh <= 0)
                 return;
@@ -1115,12 +1117,29 @@ class LauncherMirror {
                 rx + (rw - area.width * s) / 2 + (layer.x - area.x) * s,
                 ry + (rh - area.height * s) / 2 + (layer.y - area.y) * s);
         };
-        ref.connectObject('notify::allocation', fit, holder);
+        // Allocation notifications arrive in the middle of a layout pass;
+        // moving the clone right then makes Clutter complain about ancestors
+        // that have no allocation yet. Apply the fit once before the redraw.
+        let laterId = 0;
+        const queueFit = () => {
+            if (laterId)
+                return;
+            laterId = global.compositor.get_laters().add(
+                Meta.LaterType.BEFORE_REDRAW, () => {
+                    laterId = 0;
+                    fit();
+                    return GLib.SOURCE_REMOVE;
+                });
+        };
+        ref.connectObject('notify::allocation', queueFit, holder);
         if (ref !== holder)
-            holder.connectObject('notify::allocation', fit, holder);
-        layer.connectObject('notify::allocation', fit, holder);
+            holder.connectObject('notify::allocation', queueFit, holder);
+        layer.connectObject('notify::allocation', queueFit, holder);
 
         holder.connect('destroy', () => {
+            if (laterId)
+                global.compositor.get_laters().remove(laterId);
+            laterId = 0;
             this._clones.delete(holder);
             layer.disconnectObject(holder);
             ref.disconnectObject(holder);
