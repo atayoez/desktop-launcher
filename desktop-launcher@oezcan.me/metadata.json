@@ -6,5 +6,5 @@
   "shell-version": ["48", "49", "50", "51"],
   "session-modes": ["user"],
   "settings-schema": "org.gnome.shell.extensions.desktop-launcher",
-  "version": 1
+  "version": 2
 }
