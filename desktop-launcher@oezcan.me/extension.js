@@ -1023,8 +1023,7 @@ class LauncherMirror {
             origInit.call(this, metaWorkspace, monitorIndex, ...rest);
             mirror._addClone(this, monitorIndex, {
                 above: this._background,
-                ref: this._background,
-                rect: 'workarea',
+                sizeFrom: 'holder',
             });
         };
         this._patches.push(() => (ovProto._init = origInit));
@@ -1041,17 +1040,10 @@ class LauncherMirror {
         this.refreshOverview();
     }
 
-    /**
-     * Rebuild the overview's workspace views so they pick up (or drop)
-     * clones. The views only exist while the overview is shown (they are
-     * created in show and destroyed in hide), so there is nothing to do
-     * otherwise; the patched constructor covers the next show.
-     */
+    /** Rebuild the overview's workspace views so they pick up (or drop) clones. */
     refreshOverview() {
         try {
-            const display = Main.overview._overview.controls._workspacesDisplay;
-            if (display.visible && Main.overview.visible)
-                display._updateWorkspacesViews();
+            Main.overview._overview.controls._workspacesDisplay._updateWorkspacesViews();
         } catch (e) {
             logError(e, 'Desktop Launcher: could not refresh overview workspaces');
         }
@@ -1062,17 +1054,15 @@ class LauncherMirror {
      * @param {number} monitorIndex
      * @param {object} [opts]
      * @param {Clutter.Actor} [opts.above] - insert right above this child
-     * @param {Clutter.Actor} [opts.ref] - the actor whose box the clone
-     *   follows (default: the container itself)
-     * @param {string} [opts.rect] - what that box represents on screen:
-     *   'monitor' (switch animation) or 'workarea' (overview preview)
+     * @param {string} [opts.sizeFrom] - 'holder' when the container's layout
+     *   allocates the holder (BinLayout); otherwise the container's own
+     *   size is the reference box
      */
-    _addClone(container, monitorIndex, {above = null, ref = null, rect = 'monitor'} = {}) {
+    _addClone(container, monitorIndex, {above = null, sizeFrom = 'container'} = {}) {
         const layer = this._getLayer(monitorIndex);
         const monitor = Main.layoutManager.monitors[monitorIndex];
         if (!layer || !monitor)
             return;
-        ref ??= container;
 
         // A zero-size holder (see ZeroSizeHolder) parents the clone so the
         // clone can keep fixed geometry whatever layout the container uses.
@@ -1085,39 +1075,27 @@ class LauncherMirror {
         else
             container.add_child(holder);
         this._clones.add(holder);
+        const ref = sizeFrom === 'holder' ? holder : container;
 
-        // Map the layer into the reference box. The overview squeezes the
-        // work area into a box of a different aspect and crops the
-        // wallpaper; icons must not be distorted, so scale uniformly to fit
-        // and centre. When the box is the real work area (start of the
-        // overview transition) or the monitor (switch animation) this is an
-        // exact 1:1 mapping, so nothing moves.
+        // The overview squeezes the work area into a box of a different
+        // aspect and crops the wallpaper; icons must not be distorted, so
+        // scale uniformly to fit and centre. At full size (switch animation,
+        // start of the overview transition) this is an exact 1:1 mapping.
         const fit = () => {
-            // Only once everything is on stage and allocated: reading sizes
-            // earlier forces theme lookups on widgets outside the stage.
-            if (!holder.get_stage() || !layer.get_stage() ||
-                !holder.has_allocation() || !ref.has_allocation())
+            if (!holder.get_parent() || !layer.get_parent())
                 return;
-            const [rw, rh] = [ref.width, ref.height];
-            if (rw <= 0 || rh <= 0)
+            const [w, h] = [ref.width, ref.height];
+            if (w <= 0 || h <= 0)
                 return;
-            // ref and holder are siblings in the overview case; the clone's
-            // coordinates are relative to the holder.
-            const rx = ref === container ? 0 : ref.x - holder.x;
-            const ry = ref === container ? 0 : ref.y - holder.y;
-            const area = rect === 'workarea'
-                ? Main.layoutManager.getWorkAreaForMonitor(monitorIndex)
-                : monitor;
-            const s = Math.min(rw / area.width, rh / area.height);
+            const s = Math.min(w / monitor.width, h / monitor.height);
             clone.set_size(layer.width, layer.height);
             clone.set_scale(s, s);
             clone.set_position(
-                rx + (rw - area.width * s) / 2 + (layer.x - area.x) * s,
-                ry + (rh - area.height * s) / 2 + (layer.y - area.y) * s);
+                (w - monitor.width * s) / 2 + (layer.x - monitor.x) * s,
+                (h - monitor.height * s) / 2 + (layer.y - monitor.y) * s);
         };
+        fit();
         ref.connectObject('notify::allocation', fit, holder);
-        if (ref !== holder)
-            holder.connectObject('notify::allocation', fit, holder);
         layer.connectObject('notify::allocation', fit, holder);
 
         holder.connect('destroy', () => {
