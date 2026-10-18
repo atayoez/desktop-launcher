@@ -37,6 +37,8 @@ import * as AppFavorites from 'resource:///org/gnome/shell/ui/appFavorites.js';
 import {AppMenu} from 'resource:///org/gnome/shell/ui/appMenu.js';
 import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
 import * as DND from 'resource:///org/gnome/shell/ui/dnd.js';
+import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
+import * as WorkspaceAnimation from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
 import * as IconGrid from 'resource:///org/gnome/shell/ui/iconGrid.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import * as ParentalControlsManager from 'resource:///org/gnome/shell/misc/parentalControlsManager.js';
@@ -966,6 +968,145 @@ class AppGridTakeover {
     }
 }
 
+/**
+ * A container that asks for no space at all. The overview derives the
+ * workspace box from the preferred size of the background's children, so
+ * anything we add there must report 0x0, while still being allocated the
+ * full box by the parent's BinLayout (x/y_expand).
+ */
+const ZeroSizeHolder = GObject.registerClass(
+class ZeroSizeHolder extends Clutter.Actor {
+    vfunc_get_preferred_width(_forHeight) {
+        return [0, 0];
+    }
+
+    vfunc_get_preferred_height(_forWidth) {
+        return [0, 0];
+    }
+});
+
+/**
+ * Keeps the launcher visible where the Shell paints its own wallpaper
+ * copies instead of the real background: the workspace-switch animation
+ * (one WorkspaceBackground per monitor in workspaceAnimation.js) and the
+ * overview's workspace previews (workspace.js WorkspaceBackground, scaled
+ * so the work area fits its box). Both get a live Clutter.Clone of the
+ * monitor's LauncherLayer, placed where the layer sits on that monitor.
+ */
+class LauncherMirror {
+    constructor(getLayer) {
+        this._getLayer = getLayer;
+        this._clones = new Set();
+        this._patches = [];
+    }
+
+    enable() {
+        const mirror = this;
+
+        // Workspace switch: a monitor-sized, unscaled group per workspace.
+        const animProto = WorkspaceAnimation.WorkspaceBackground.prototype;
+        const origCreateBackground = animProto._createBackground;
+        animProto._createBackground = function (...args) {
+            origCreateBackground.apply(this, args);
+            mirror._addClone(this, this._monitor.index);
+        };
+        this._patches.push(() => (animProto._createBackground = origCreateBackground));
+
+        // Overview preview: Workspace is a BinLayout holding the (scaled,
+        // squeezed) WorkspaceBackground and the window previews. The clone
+        // goes between them and fits itself to the same box. It must not
+        // live inside the background: the overview derives the workspace
+        // box from that actor's preferred size.
+        const ovProto = Workspace.Workspace.prototype;
+        const origInit = ovProto._init;
+        ovProto._init = function (metaWorkspace, monitorIndex, ...rest) {
+            origInit.call(this, metaWorkspace, monitorIndex, ...rest);
+            mirror._addClone(this, monitorIndex, {
+                above: this._background,
+                sizeFrom: 'holder',
+            });
+        };
+        this._patches.push(() => (ovProto._init = origInit));
+
+        this.refreshOverview();
+    }
+
+    disable() {
+        while (this._patches.length)
+            this._patches.pop()();
+        for (const clone of this._clones)
+            clone.destroy();
+        this._clones.clear();
+        this.refreshOverview();
+    }
+
+    /** Rebuild the overview's workspace views so they pick up (or drop) clones. */
+    refreshOverview() {
+        try {
+            Main.overview._overview.controls._workspacesDisplay._updateWorkspacesViews();
+        } catch (e) {
+            logError(e, 'Desktop Launcher: could not refresh overview workspaces');
+        }
+    }
+
+    /**
+     * @param {Clutter.Actor} container - where the holder goes
+     * @param {number} monitorIndex
+     * @param {object} [opts]
+     * @param {Clutter.Actor} [opts.above] - insert right above this child
+     * @param {string} [opts.sizeFrom] - 'holder' when the container's layout
+     *   allocates the holder (BinLayout); otherwise the container's own
+     *   size is the reference box
+     */
+    _addClone(container, monitorIndex, {above = null, sizeFrom = 'container'} = {}) {
+        const layer = this._getLayer(monitorIndex);
+        const monitor = Main.layoutManager.monitors[monitorIndex];
+        if (!layer || !monitor)
+            return;
+
+        // A zero-size holder (see ZeroSizeHolder) parents the clone so the
+        // clone can keep fixed geometry whatever layout the container uses.
+        const holder = new ZeroSizeHolder({x_expand: true, y_expand: true});
+        const clone = new Clutter.Clone({source: layer});
+        clone.set_pivot_point(0, 0);
+        holder.add_child(clone);
+        if (above)
+            container.insert_child_above(holder, above);
+        else
+            container.add_child(holder);
+        this._clones.add(holder);
+        const ref = sizeFrom === 'holder' ? holder : container;
+
+        // The overview squeezes the work area into a box of a different
+        // aspect and crops the wallpaper; icons must not be distorted, so
+        // scale uniformly to fit and centre. At full size (switch animation,
+        // start of the overview transition) this is an exact 1:1 mapping.
+        const fit = () => {
+            if (!holder.get_parent() || !layer.get_parent())
+                return;
+            const [w, h] = [ref.width, ref.height];
+            if (w <= 0 || h <= 0)
+                return;
+            const s = Math.min(w / monitor.width, h / monitor.height);
+            clone.set_size(layer.width, layer.height);
+            clone.set_scale(s, s);
+            clone.set_position(
+                (w - monitor.width * s) / 2 + (layer.x - monitor.x) * s,
+                (h - monitor.height * s) / 2 + (layer.y - monitor.y) * s);
+        };
+        fit();
+        ref.connectObject('notify::allocation', fit, holder);
+        layer.connectObject('notify::allocation', fit, holder);
+
+        holder.connect('destroy', () => {
+            this._clones.delete(holder);
+            layer.disconnectObject(holder);
+            ref.disconnectObject(holder);
+        });
+        layer.connectObject('destroy', () => holder.destroy(), holder);
+    }
+}
+
 export default class DesktopLauncherExtension extends Extension {
     enable() {
         this._settings = this.getSettings();
@@ -1036,6 +1177,12 @@ export default class DesktopLauncherExtension extends Extension {
         this._syncAppGridTakeover();
 
         this._createLayers();
+
+        // Show the launcher inside the workspace-switch animation and the
+        // overview's workspace previews too.
+        this._mirror = new LauncherMirror(
+            index => this._layers.find(l => l.monitorIndex === index));
+        this._mirror.enable();
     }
 
     _syncAppGridTakeover() {
@@ -1066,6 +1213,8 @@ export default class DesktopLauncherExtension extends Extension {
             this._rebuildIdleId = 0;
         }
 
+        this._mirror?.disable();
+        this._mirror = null;
         this._destroyLayers();
         this._appGridTakeover?.disable();
         this._appGridTakeover = null;
@@ -1112,6 +1261,7 @@ export default class DesktopLauncherExtension extends Extension {
             this._layers.push(layer);
         }
         this._raise();
+        this._mirror?.refreshOverview();
     }
 
     _raise() {

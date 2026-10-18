@@ -29,6 +29,7 @@ A GNOME Shell extension that draws your apps on the wallpaper, behind every wind
 | **Drag to reorder** | Press and hold, then drag. All Apps keeps your order, dragging in the Favourites row reorders GNOME's favourites, and dropping an app on the Favourites row pins it. |
 | **No duplicates with the dock** | Pinned and running apps are already in the dock, so they stay out of All Apps and folders until unpinned or closed. |
 | **Replace GNOME's app grid** | Optional: the Show Apps button, in the GNOME dash or in Dash to Panel, and Super+A minimize every window with GNOME's animation to reveal the launcher. Press again and the windows come back. |
+| **Always there** | The launcher stays visible while you swipe between workspaces and inside the overview's workspace previews, where GNOME otherwise paints its own copies of the wallpaper. |
 | **Theme-native** | Tiles reuse the Shell's own icon and menu classes, so they follow your Shell theme, accent colour and icon theme. Running apps get a dot. |
 
 <div align="center">
@@ -95,6 +96,8 @@ The drag order of All Apps is stored in the `app-order` key and never needs touc
 The Shell keeps its wallpaper actors in a `Meta.BackgroundGroup` at the bottom of `global.window_group`. The extension adds one `LauncherLayer` per monitor to that group, sized to the monitor's work area. Being inside the window group puts the layer above the wallpaper and below all windows, and the overview, which draws its own backgrounds, never shows it. When the Shell recreates a wallpaper actor (wallpaper change, monitor hot-plug) it lands on top of the layer, so the extension listens for `child-added` on the group and moves itself back up.
 
 Tiles are `St.Button`s around the Shell's `IconGrid.BaseIcon`; the context menu is the Shell's `AppMenu`. Folders are read from `org.gnome.desktop.app-folders` and resolved like the overview does: explicit `apps`, plus apps whose categories intersect the folder's `categories`, minus `excluded-apps`.
+
+**Workspace switch and overview.** During a workspace switch and in the overview, the Shell paints its own wallpaper copies above the window layer (`workspaceAnimation.js` and `workspace.js`), which would hide the launcher. The extension adds a live `Clutter.Clone` of the monitor's layer to each of those: into every switch-animation background group, and into each overview `Workspace` between its background and its window previews. The overview squeezes the work area into a box of a different aspect, so the clone is scaled uniformly to fit and centred; at full size this is an exact 1:1 mapping, so the swipe-up transition starts seamlessly. The clone lives beside the overview background rather than inside it, because the overview derives the workspace box from that actor's preferred size.
 
 **Reordering.** Tiles are Shell DND sources and each section's grid is a drop target. While a tile is dragged over its own section the faded source tile acts as the placeholder and the grid re-attaches its children live. The drop writes `app-order`, or for the Favourites row calls `AppFavorites.moveFavoriteToPos`; dropping an All Apps tile on the Favourites row calls `addFavoriteAtPos`.
 
