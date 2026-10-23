@@ -17,10 +17,10 @@
       <summary>Replace GNOME's app grid with the desktop</summary>
       <description>The Show Apps button (GNOME dash or Dash to Panel) and Super+A reveal the desktop launcher by minimizing all windows with GNOME's animation, instead of opening the overview app grid. Pressing again restores the windows. Swiping or scrolling to the app grid page in the overview is disabled.</description>
     </key>
-    <key name="app-order" type="as">
+    <key name="app-layout" type="aa{sv}">
       <default>[]</default>
-      <summary>Order of the All Apps grid</summary>
-      <description>Desktop file ids and "folder:ID" entries in display order, written when tiles are dragged. Items not listed are appended in default order.</description>
+      <summary>Layout of the desktop app grid</summary>
+      <description>Pages of the desktop app grid with each app's position, in the format of org.gnome.shell app-picker-layout, written when apps are dragged. Kept apart from the overview's layout because the desktop's pages are bigger.</description>
     </key>
     <key name="all-monitors" type="b">
       <default>false</default>

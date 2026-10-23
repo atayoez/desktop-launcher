@@ -53,12 +53,60 @@ const FOCUS_FADE_TIME = 250;      // the overview's animation time
 const BLUR_MY_SHELL_TARGET = 'bms-keyboard-surface';
 
 /**
+ * The desktop grid's saved layout: the overview's PageManager
+ * (appDisplay.js), stored in this extension's app-layout key instead of
+ * the overview's app-picker-layout. The overview's pages hold 24 apps or
+ * so; sharing them would leave the desktop's bigger pages half empty, as
+ * the grid keeps every app on the page it was saved on.
+ */
+const DesktopPageManager = GObject.registerClass({
+    Signals: {'layout-changed': {}},
+}, class DesktopPageManager extends GObject.Object {
+    _init(settings) {
+        super._init();
+        this._settings = settings;
+        this._updatingPages = false;
+        this._loadPages();
+        settings.connectObject('changed::app-layout', () => this._loadPages(), this);
+    }
+
+    destroy() {
+        this._settings.disconnectObject(this);
+    }
+
+    _loadPages() {
+        this._pages = this._settings.get_value('app-layout').recursiveUnpack();
+        if (!this._updatingPages)
+            this.emit('layout-changed');
+    }
+
+    getAppPosition(appId) {
+        const page = this._pages.findIndex(pageData => appId in pageData);
+        return page === -1 ? [-1, -1] : [page, this._pages[page][appId].position];
+    }
+
+    set pages(pages) {
+        const packed = pages.map(page => Object.fromEntries(
+            Object.entries(page).map(([appId, properties]) =>
+                [appId, new GLib.Variant('a{sv}', properties)])));
+        this._updatingPages = true;
+        this._settings.set_value('app-layout', new GLib.Variant('aa{sv}', packed));
+        this._updatingPages = false;
+    }
+
+    get pages() {
+        return this._pages;
+    }
+});
+
+/**
  * The launcher for one monitor: the Shell's own app grid (AppDisplay, the
  * overview's "Show Apps" page) hosted on the desktop. Pages, folders and
- * their dialogs, drag and drop, the saved order (app-picker-layout, shared
- * with the overview) and keyboard navigation are all the Shell's code; the
- * layer only places the grid in the monitor's work area and brings the
- * folder dialogs, which the grid puts into the overview, to the desktop.
+ * their dialogs, drag and drop and keyboard navigation are all the Shell's
+ * code. The layer places the grid in the monitor's work area, sizes its
+ * pages for the desktop, keeps its saved layout apart from the overview's
+ * (DesktopPageManager) and brings the folder dialogs, which the grid puts
+ * into the overview, to the desktop.
  */
 const LauncherLayer = GObject.registerClass(
 class LauncherLayer extends St.Widget {
@@ -76,6 +124,8 @@ class LauncherLayer extends St.Widget {
         this.monitorIndex = monitorIndex;
         this._settings = settings;
         this._faded = false;
+        this._fitId = 0;
+        this._reflowPending = false;
 
         // The grid connects to these for good (the overview never destroys
         // its own); keep the ids to disconnect on destroy.
@@ -93,6 +143,21 @@ class LauncherLayer extends St.Widget {
             this.get_parent().add_child(dialog);
         };
 
+        // Its own saved layout instead of the overview's (see above).
+        this._pageManager = new DesktopPageManager(settings);
+        this._appDisplay._pageManager = this._pageManager;
+        this._pageManager.connect('layout-changed', () => this._appDisplay._redisplay());
+
+        // The grid keeps a fifth of its width free at the sides for
+        // previews of the neighbouring pages, an overview design; on the
+        // desktop only the page arrows need room there.
+        const gridLayout = this._appDisplay._appGridLayout;
+        gridLayout._getIndicatorsWidth = box => {
+            const [, height] = box.get_size();
+            return Math.max(...[gridLayout._nextPageArrow, gridLayout._previousPageArrow]
+                .map(arrow => arrow.get_preferred_width(height)[0]));
+        };
+
         // Fading (open windows) and search hide the grid separately.
         this._content = new St.Widget({
             layout_manager: new Clutter.BinLayout(),
@@ -101,6 +166,35 @@ class LauncherLayer extends St.Widget {
         });
         this._content.add_child(this._appDisplay);
         this.add_child(this._content);
+
+        // The grid picks one of a few fixed page layouts (8x3, 6x4, ...)
+        // and grows its icons to fill it, leaving empty sides on a wide
+        // desktop. Instead keep the icons at the icon-size setting and give
+        // it as many columns and rows as fit, through its own setGridModes.
+        this._grid = this._appDisplay._grid;
+        this._grid.layout_manager.fixed_icon_size = settings.get_int('icon-size');
+        this._appDisplay._scrollView.connectObject('notify::allocation',
+            () => this._queueFitGrid(), this);
+        // A new page size only takes effect at the grid's next allocation;
+        // refit (and reflow) once it has.
+        this._grid.layout_manager.connectObject(
+            'notify::columns-per-page', () => this._queueFitGrid(),
+            'notify::rows-per-page', () => this._queueFitGrid(),
+            this);
+        settings.connectObject('changed::icon-size', () => {
+            this._grid.layout_manager.fixed_icon_size = settings.get_int('icon-size');
+            this._queueFitGrid();
+        }, this);
+
+        // An icon hovered by a drag keeps its folder preview after the drop
+        // until the pointer moves over it again (the overview's grid does
+        // too, but the overview closes); clear it when a drag ends.
+        const clearDropHover = () => this._appDisplay._orderedItems
+            .forEach(item => item._setHoveringByDnd?.(false));
+        Main.overview.connectObject(
+            'item-drag-end', clearDropHover,
+            'item-drag-cancelled', clearDropHover,
+            this);
 
         // In the overview, launching an app hides the overview and with it
         // the folder dialog; here the dialog closes itself.
@@ -114,6 +208,9 @@ class LauncherLayer extends St.Widget {
         }, this);
 
         this.connect('destroy', () => {
+            if (this._fitId)
+                GLib.source_remove(this._fitId);
+            this._pageManager.destroy();
             for (const [obj, id] of this._globalHandlers)
                 obj.disconnect(id);
             if (this._appDisplay._overviewHiddenId)
@@ -144,6 +241,73 @@ class LauncherLayer extends St.Widget {
 
     closeFolder() {
         this._appDisplay._currentDialog?.popdown();
+    }
+
+    /** After the allocation that triggered it, not inside it. */
+    _queueFitGrid() {
+        if (this._fitId)
+            return;
+        this._fitId = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            this._fitId = 0;
+            this._fitGrid();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    /**
+     * As many columns and rows of icons as fit one page. The grid applies
+     * a new page size at its next allocation, so the pages are reflowed
+     * on the fit after that.
+     */
+    _fitGrid() {
+        const item = this._appDisplay._orderedItems[0];
+        const [width, height] = this._appDisplay._scrollView.allocation.get_size();
+        if (!item || width === 0 || height === 0)
+            return;
+        const layout = this._grid.layout_manager;
+        const padding = layout.page_padding;
+        const [, itemWidth] = item.get_preferred_width(-1);
+        const [, itemHeight] = item.get_preferred_height(-1);
+        const fit = (space, size, spacing) =>
+            Math.max(1, Math.floor((space + spacing) / (size + spacing)));
+        const columns = fit(width - padding.left - padding.right,
+            itemWidth, layout.column_spacing);
+        const rows = fit(height - padding.top - padding.bottom,
+            itemHeight, layout.row_spacing);
+        if (layout.columns_per_page === columns && layout.rows_per_page === rows) {
+            if (this._reflowPending)
+                this._reflowPages();
+            return;
+        }
+        this._reflowPending = true;
+        this._grid.setGridModes([{columns, rows}]);
+    }
+
+    /**
+     * The grid starts with its default page size and was filled with it;
+     * apps it pushed onto later pages don't move back when pages grow.
+     * Put them where the saved layout has them, or, with nothing saved
+     * yet, fill the pages in order and save that.
+     */
+    _reflowPages() {
+        this._reflowPending = false;
+        if (this._pageManager.pages.length > 0) {
+            this._appDisplay._redisplay();
+            return;
+        }
+        // The grid's own refill pulls from the next page only; repeat
+        // until each page is full or nothing follows it.
+        const layout = this._grid.layout_manager;
+        const perPage = layout.columns_per_page * layout.rows_per_page;
+        for (let page = 0; page < this._grid.nPages - 1; page++) {
+            let count;
+            do {
+                count = this._grid.getItemsAtPage(page).filter(c => c.visible).length;
+                layout._fillItemVacancies(page);
+            } while (count < perPage && page < this._grid.nPages - 1 &&
+                this._grid.getItemsAtPage(page).filter(c => c.visible).length > count);
+        }
+        this._appDisplay._savePages();
     }
 
     /**
