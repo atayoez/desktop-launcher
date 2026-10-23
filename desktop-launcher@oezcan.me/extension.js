@@ -1660,9 +1660,9 @@ class LauncherLayer extends St.Widget {
     }
 
     /**
-     * Fade the icons out while an app has the focus. Faded, they are hidden
-     * too, so a click on the desktop can't launch anything unseen; it goes
-     * to the wallpaper and brings the desktop (and the icons) back.
+     * Fade the icons out while app windows are open on this monitor.
+     * Faded, they are hidden too, so a click beside the windows can't
+     * launch anything unseen.
      */
     setFaded(faded) {
         if (this._faded === faded)
@@ -2407,7 +2407,8 @@ export default class DesktopLauncherExtension extends Extension {
         this._layers = [];
         this._raiseLaterId = 0;
         this._rebuildIdleId = 0;
-        this._focusSyncId = 0;
+        this._windowSyncId = 0;
+        this._watchedWindows = new Set();
 
         this._bgGroup = Main.layoutManager._backgroundGroup;
 
@@ -2445,11 +2446,18 @@ export default class DesktopLauncherExtension extends Extension {
             return Clutter.EVENT_PROPAGATE;
         }, this);
 
-        // The icons fade out while an app window has the focus and come
-        // back when the desktop does (no focused window, or the keyboard on
-        // the launcher after a click on the desktop).
-        global.display.connectObject('notify::focus-window', () => this._queueFocusSync(), this);
-        global.stage.connectObject('notify::key-focus', () => this._queueFocusSync(), this);
+        // The icons fade out while their monitor has open (not minimised)
+        // app windows on the current workspace, and come back once it has
+        // none. Watch for windows appearing, going, (un)minimising and
+        // moving between workspaces and monitors.
+        global.display.connectObject(
+            'window-created', (_display, win) => this._watchWindow(win),
+            'window-entered-monitor', () => this._queueWindowSync(),
+            'window-left-monitor', () => this._queueWindowSync(),
+            this);
+        global.workspace_manager.connectObject('active-workspace-changed',
+            () => this._queueWindowSync(), this);
+        global.get_window_actors().forEach(actor => this._watchWindow(actor.meta_window));
 
         // Type-to-search lives on the primary monitor's launcher.
         this._search = new DesktopSearch();
@@ -2534,10 +2542,13 @@ export default class DesktopLauncherExtension extends Extension {
             GLib.Source.remove(this._rebuildIdleId);
             this._rebuildIdleId = 0;
         }
-        if (this._focusSyncId) {
-            GLib.Source.remove(this._focusSyncId);
-            this._focusSyncId = 0;
+        if (this._windowSyncId) {
+            GLib.Source.remove(this._windowSyncId);
+            this._windowSyncId = 0;
         }
+        global.workspace_manager.disconnectObject(this);
+        this._watchedWindows.forEach(win => win.disconnectObject(this));
+        this._watchedWindows.clear();
 
         this._mirror?.disable();
         this._mirror = null;
@@ -2604,7 +2615,7 @@ export default class DesktopLauncherExtension extends Extension {
             }
         }
         this._raise();
-        this._syncFocusFade();
+        this._syncWindowFade();
         this._mirror?.refreshOverview();
     }
 
@@ -2631,25 +2642,48 @@ export default class DesktopLauncherExtension extends Extension {
             });
     }
 
-    /**
-     * Focus moves in steps (the old window loses it before the next one
-     * gets it), so decide once it has settled, or the icons would flash.
-     */
-    _queueFocusSync() {
-        if (this._focusSyncId)
+    _watchWindow(win) {
+        if (!win || this._watchedWindows.has(win))
             return;
-        this._focusSyncId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
-            this._focusSyncId = 0;
-            this._syncFocusFade();
+        this._watchedWindows.add(win);
+        win.connectObject(
+            'notify::minimized', () => this._queueWindowSync(),
+            'workspace-changed', () => this._queueWindowSync(),
+            'unmanaged', () => {
+                win.disconnectObject(this);
+                this._watchedWindows.delete(win);
+                this._queueWindowSync();
+            },
+            this);
+        this._queueWindowSync();
+    }
+
+    /** Window changes come in bursts; look once they have settled. */
+    _queueWindowSync() {
+        if (this._windowSyncId)
+            return;
+        this._windowSyncId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._windowSyncId = 0;
+            this._syncWindowFade();
             return GLib.SOURCE_REMOVE;
         });
     }
 
-    _syncFocusFade() {
-        const focus = global.stage.key_focus;
-        const onDesktop = !global.display.focus_window ||
-            (focus !== null && this._bgGroup.contains(focus));
-        this._layers.forEach(l => l.setFaded(!onDesktop));
+    /** Fade each monitor's icons while it shows an app window. */
+    _syncWindowFade() {
+        const workspace = global.workspace_manager.get_active_workspace();
+        const busyMonitors = new Set();
+        for (const actor of global.get_window_actors()) {
+            const win = actor.meta_window;
+            if (win &&
+                win.showing_on_its_workspace() &&
+                win.located_on_workspace(workspace) &&
+                !win.skip_taskbar &&
+                [Meta.WindowType.NORMAL, Meta.WindowType.DIALOG,
+                    Meta.WindowType.MODAL_DIALOG].includes(win.window_type))
+                busyMonitors.add(win.get_monitor());
+        }
+        this._layers.forEach(l => l.setFaded(busyMonitors.has(l.monitorIndex)));
     }
 
     _queueRebuild() {
