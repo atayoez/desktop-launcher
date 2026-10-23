@@ -54,18 +54,6 @@
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
 }
 
-/* Open folder: the theme's own .app-folder-dialog, as in the overview. Only
-   its fixed 720x720 size is dropped so it fits the folder's apps; the grid
-   gets the room the overview's folder view has. */
-.desktop-launcher-folder-dialog.app-folder-dialog {
-  width: auto;
-  height: auto;
-}
-
-.desktop-launcher-folder-scroll {
-  padding: 24px 36px 36px 36px;
-}
-
 /* Type-to-search: the overview's search entry and results, styled by the
    Shell theme's own classes, straight on the wallpaper like the overview. */
 .desktop-launcher-search {
