@@ -17,7 +17,9 @@
 //
 // Z-order is kept by listening to 'child-added' on the background group:
 // whenever the Shell recreates a wallpaper actor (wallpaper change, monitor
-// hotplug) it lands on top, and we move our layers back above it.
+// hotplug) it lands on top, and we move it back to the bottom. Everything
+// else keeps its place: the search and open folders sit above the layers,
+// with Blur my Shell's blur (if any) between them.
 
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
@@ -41,6 +43,8 @@ import * as Workspace from 'resource:///org/gnome/shell/ui/workspace.js';
 import * as WorkspaceAnimation from 'resource:///org/gnome/shell/ui/workspaceAnimation.js';
 import * as IconGrid from 'resource:///org/gnome/shell/ui/iconGrid.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import * as Search from 'resource:///org/gnome/shell/ui/search.js';
+import * as ShellEntry from 'resource:///org/gnome/shell/ui/shellEntry.js';
 import * as ParentalControlsManager from 'resource:///org/gnome/shell/misc/parentalControlsManager.js';
 
 const TILE_PADDING = 24;   // extra room around the icon inside a tile
@@ -50,6 +54,36 @@ const FOLDER_SCHEMA = 'org.gnome.desktop.app-folders';
 const FOLDER_SUBICON_FRACTION = 0.4;   // same as the Shell's app grid
 const FOLDER_ANIMATION_TIME = 150;
 const DRAG_FADE_TIME = 150;
+
+// Drag and drop follows the overview's app grid (appDisplay.js, iconGrid.js):
+// the outer DIVIDER_LEEWAY pixels of a tile are "between" tiles and move
+// the dragged item there after DELAYED_MOVE_TIMEOUT; the rest of the tile
+// is "on" it: drop an app there to make a folder (the target shrinks into a
+// folder preview after FOLDER_PREVIEW_DELAY) or to put it in a folder.
+const DragLocation = {
+    INVALID: 0,
+    START_EDGE: 1,
+    END_EDGE: 2,
+    ON_ICON: 3,
+    EMPTY_SPACE: 4,
+};
+const DIVIDER_LEEWAY = 20;
+const DELAYED_MOVE_TIMEOUT = 200;
+const FOLDER_PREVIEW_DELAY = 500;
+// Dragging an app out of an open folder closes it after this long.
+const POPDOWN_DIALOG_TIMEOUT = 500;
+// Not in the overview: holding a dragged app over a folder opens it.
+const FOLDER_SPRING_DELAY = 600;
+
+// Blur my Shell has no API for other extensions. Its popup blur scans the
+// direct children of the Shell's top-level groups, including the window
+// group's background group, for actors with one of its target style
+// classes, and blurs what is behind them with the user's popup settings,
+// following their visibility, opacity and size. This one is its own marker
+// class (no theme styles it), so the full-screen search and the open
+// folder's backdrop get the background blurred behind them. Both must be
+// direct children of the background group, above the launcher layer.
+const BLUR_MY_SHELL_TARGET = 'bms-keyboard-surface';
 
 function getCategories(info) {
     const str = info.get_categories();
@@ -81,10 +115,7 @@ function loadFolders(folderSettings, apps) {
     const folders = [];
 
     for (const id of folderSettings.get_strv('folder-children')) {
-        const folder = new Gio.Settings({
-            schema_id: `${FOLDER_SCHEMA}.folder`,
-            path: `${folderSettings.path}folders/${id}/`,
-        });
+        const folder = getFolder(folderSettings, id);
         const excluded = new Set(folder.get_strv('excluded-apps'));
         const members = new Map();
 
@@ -105,14 +136,112 @@ function loadFolders(folderSettings, apps) {
 
         if (members.size === 0)
             continue;
+        // Order: 'apps' as stored (dragging inside a folder rewrites it),
+        // then category matches by name, as the overview's FolderView.
         folders.push({
             id,
             name: getFolderName(folder),
-            apps: [...members.values()]
-                .sort((a, b) => a.get_name().localeCompare(b.get_name())),
+            apps: [...members.values()],
         });
     }
     return folders;
+}
+
+function getFolder(folderSettings, id) {
+    return new Gio.Settings({
+        schema_id: `${FOLDER_SCHEMA}.folder`,
+        path: `${folderSettings.path}folders/${id}/`,
+    });
+}
+
+/**
+ * Name for a new folder: the first category all its apps share that has a
+ * translated .directory name, like the overview's _findBestFolderName.
+ */
+function findBestFolderName(apps) {
+    const [first, ...rest] = apps.map(app => getCategories(app.get_app_info()));
+    const common = first.filter(c => c.length > 0 && rest.every(cats => cats.includes(c)));
+    for (const category of common) {
+        const translated = Shell.util_get_translated_folder_name(`${category}.directory`);
+        if (translated !== null)
+            return translated;
+    }
+    return _('Unnamed Folder');
+}
+
+/**
+ * Create a GNOME app folder holding the given apps, as the overview does.
+ *
+ * @param {Gio.Settings} folderSettings
+ * @param {Shell.App[]} apps
+ * @returns {string} the new folder id
+ */
+function createFolder(folderSettings, apps) {
+    const id = GLib.uuid_string_random();
+    folderSettings.set_strv('folder-children',
+        [...folderSettings.get_strv('folder-children'), id]);
+
+    const folder = getFolder(folderSettings, id);
+    folder.delay();
+    folder.set_string('name', findBestFolderName(apps));
+    folder.set_strv('apps', apps.map(app => app.get_id()));
+    folder.apply();
+    return id;
+}
+
+function addAppToFolder(folderSettings, id, appId) {
+    const folder = getFolder(folderSettings, id);
+    const apps = folder.get_strv('apps');
+    if (!apps.includes(appId))
+        folder.set_strv('apps', [...apps, appId]);
+    // Only categories-based folders have excluded apps.
+    const excluded = folder.get_strv('excluded-apps');
+    if (excluded.includes(appId))
+        folder.set_strv('excluded-apps', excluded.filter(a => a !== appId));
+}
+
+/**
+ * Store the order of a folder's visible apps. Listed apps the launcher
+ * doesn't show (pinned or running ones) keep their entry after them.
+ */
+function setFolderOrder(folderSettings, id, appIds) {
+    const folder = getFolder(folderSettings, id);
+    const hidden = folder.get_strv('apps').filter(a => !appIds.includes(a));
+    folder.set_strv('apps', [...appIds, ...hidden]);
+}
+
+/**
+ * Take an app out of a folder. A categories-based folder lists it in
+ * 'excluded-apps' so the category match doesn't pull it back in; a folder
+ * left with neither apps nor categories is deleted.
+ */
+function removeAppFromFolder(folderSettings, id, appId) {
+    const folder = getFolder(folderSettings, id);
+    const apps = folder.get_strv('apps').filter(a => a !== appId);
+    const categories = folder.get_strv('categories');
+
+    if (apps.length === 0 && categories.length === 0) {
+        // Resetting all keys deletes the relocatable schema's data.
+        for (const key of folder.settings_schema.list_keys())
+            folder.reset(key);
+        folderSettings.set_strv('folder-children',
+            folderSettings.get_strv('folder-children').filter(f => f !== id));
+        return;
+    }
+
+    if (categories.length > 0) {
+        const excluded = folder.get_strv('excluded-apps');
+        if (!excluded.includes(appId))
+            folder.set_strv('excluded-apps', [...excluded, appId]);
+    }
+    folder.set_strv('apps', apps);
+}
+
+/** Whether the stage point (x, y) is inside the actor. */
+function isInside(actor, x, y) {
+    const [ax, ay] = actor.get_transformed_position();
+    const [aw, ah] = actor.get_transformed_size();
+    return x >= ax && x < ax + aw && y >= ay && y < ay + ah;
 }
 
 /** Side length of a (square) tile for the given settings. */
@@ -121,9 +250,10 @@ function tileSide(iconSize, showLabel) {
 }
 
 /**
- * Drag-source behaviour shared by app and folder tiles. The tile fades
- * while a copy of its icon follows the pointer (Shell DND); sections listen
- * on tile.draggable for drag-begin / drag-end to reorder and persist.
+ * Drag-source behaviour shared by app and folder tiles. Like the overview's
+ * scaleAndFade(), the tile shrinks away and leaves an empty slot while a
+ * copy of its icon follows the pointer (Shell DND); sections listen on
+ * tile.draggable for drag-begin / drag-end to reorder and persist.
  *
  * @param {St.Button} tile
  */
@@ -131,16 +261,18 @@ function makeTileDraggable(tile) {
     tile._delegate = tile;
     tile.draggable = DND.makeDraggable(tile, {timeoutThreshold: 200});
     tile.draggable.connect('drag-begin', () => {
+        tile.reactive = false;
         tile.set_pivot_point(0.5, 0.5);
         tile.ease({
-            opacity: 80,
-            scale_x: 0.9,
-            scale_y: 0.9,
+            opacity: 0,
+            scale_x: 0.5,
+            scale_y: 0.5,
             duration: DRAG_FADE_TIME,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         });
     });
     tile.draggable.connect('drag-end', () => {
+        tile.reactive = true;
         tile.ease({
             opacity: 255,
             scale_x: 1,
@@ -179,6 +311,8 @@ class AppTile extends St.Button {
 
         this.app = app;
         this.key = app.get_id();
+        // Set on tiles inside an open folder: the folder they come from.
+        this.folderId = null;
 
         // St.Button is a bin, so stack icon and running-dot in a box.
         this._box = new St.Widget({
@@ -258,6 +392,26 @@ class AppTile extends St.Button {
 
     _updateDot() {
         this._dot.visible = this.app.state === Shell.AppState.RUNNING;
+    }
+
+    /** An app hovered by another app shrinks to show it becomes a folder. */
+    showFolderPreview() {
+        if (this.icon.label)
+            this.icon.label.opacity = 0;
+        this.icon.icon.set_pivot_point(0.5, 0.5);
+        this.icon.icon.ease({
+            scale_x: FOLDER_SUBICON_FRACTION,
+            scale_y: FOLDER_SUBICON_FRACTION,
+        });
+    }
+
+    hideFolderPreview() {
+        if (this.icon.label)
+            this.icon.label.opacity = 255;
+        this.icon.icon.ease({
+            scale_x: 1,
+            scale_y: 1,
+        });
     }
 
     vfunc_clicked(button) {
@@ -368,16 +522,37 @@ const FolderTile = GObject.registerClass({
 });
 
 /**
- * The opened folder: an invisible backdrop over the launcher (so a click
- * outside closes it) with a centred panel holding the folder's apps.
- * Launching an app closes it too.
+ * The opened folder, after the overview's AppFolderDialog: an invisible
+ * backdrop over the launcher (a click outside closes it) with a centred
+ * panel holding the folder's apps. Launching an app closes it too.
+ *
+ * Apps inside are reordered by dragging, like any grid ('reordered' with
+ * the new order). Dragging one out of the panel closes the folder after
+ * POPDOWN_DIALOG_TIMEOUT so it can be dropped on the grid behind; dropping
+ * it on the backdrop before that emits 'app-removed'. The popup only hides
+ * meanwhile: the dragged tile lives in it until the drag ends.
+ *
+ * The pencil next to the title renames the folder. The launcher lives
+ * below the windows, which own the keyboard, so the entry takes a modal
+ * grab while editing. Enter saves; Escape or a click outside saves and
+ * closes, as in the overview. 'rename-finished' carries the new name.
+ *
+ * Opened by holding a dragged app over the folder (dragSource), the panel
+ * takes the drop ('app-added' with the position), and so does the
+ * backdrop until the pointer has been inside the panel.
  */
 const FolderPopup = GObject.registerClass({
-    Signals: {'closed': {}},
+    Signals: {
+        'closed': {},
+        'rename-finished': {param_types: [GObject.TYPE_STRING]},
+        'reordered': {param_types: [GObject.TYPE_JSOBJECT]},
+        'app-added': {param_types: [GObject.TYPE_JSOBJECT, GObject.TYPE_INT]},
+        'app-removed': {param_types: [GObject.TYPE_JSOBJECT]},
+    },
 }, class FolderPopup extends St.Widget {
-    _init(folder, tileParams, columns) {
+    _init(folder, tileParams, columns, {animate = true, dragSource = null} = {}) {
         super._init({
-            style_class: 'desktop-launcher-folder-backdrop',
+            style_class: `desktop-launcher-folder-backdrop ${BLUR_MY_SHELL_TARGET}`,
             layout_manager: new Clutter.BinLayout(),
             reactive: true,
             x_expand: true,
@@ -386,6 +561,11 @@ const FolderPopup = GObject.registerClass({
 
         this.folder = folder;
         this._closing = false;
+        this._hiddenForDrag = false;
+        this._grab = null;
+        this._entry = null;
+        this._dragMonitor = null;
+        this._popdownId = 0;
 
         this._panel = new St.BoxLayout({
             style_class: 'desktop-launcher-folder-popup',
@@ -396,10 +576,33 @@ const FolderPopup = GObject.registerClass({
         });
         this.add_child(this._panel);
 
-        this._panel.add_child(new St.Label({
+        this._header = new St.BoxLayout({
+            style_class: 'desktop-launcher-folder-header',
+            x_align: Clutter.ActorAlign.CENTER,
+        });
+        this._panel.add_child(this._header);
+
+        this._title = new St.Label({
             style_class: 'desktop-launcher-folder-title',
             text: folder.name,
-        }));
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._header.add_child(this._title);
+
+        this._renameButton = new St.Button({
+            style_class: 'desktop-launcher-folder-rename',
+            child: new St.Icon({icon_name: 'document-edit-symbolic'}),
+            accessible_name: _('Rename'),
+            can_focus: true,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+        this._renameButton.connect('clicked', () => {
+            if (this._entry)
+                this._finishRename();
+            else
+                this._startRename();
+        });
+        this._header.add_child(this._renameButton);
 
         const scroll = new St.ScrollView({
             hscrollbar_policy: St.PolicyType.NEVER,
@@ -408,12 +611,66 @@ const FolderPopup = GObject.registerClass({
         this._panel.add_child(scroll);
 
         const tiles = folder.apps.map(app => {
-            const tile = new AppTile(app, tileParams);
+            const tile = new AppTile(app, {...tileParams, draggable: true});
+            tile.folderId = folder.id;
             tile.connect('clicked', () => this.close());
             return tile;
         });
-        const grid = new Section(null, tiles, false, Math.min(columns, tiles.length));
+        const accepts = source => source === dragSource;
+        const slots = tiles.length + (dragSource ? 1 : 0);
+        const grid = new Section(null, tiles, false, Math.min(columns, slots), {
+            acceptsExternal: accepts,
+            externalPlaceholder: true,
+        });
+        grid.connect('reordered', () => this.emit('reordered', grid.getKeys()));
+        grid.connect('external-drop', (_s, source, index) => this._addApp(source, index));
+        if (dragSource)
+            grid.reserveExternalSlot();
         scroll.set_child(grid);
+
+        // Outside the grid: the panel (title, padding) keeps an app in the
+        // folder, the backdrop takes it out (or, for an app brought in by
+        // holding it over the folder, still puts it in).
+        const isOwn = source => tiles.includes(source);
+        this._panel._delegate = {
+            handleDragOver: source => (isOwn(source) || accepts(source)
+                ? DND.DragMotionResult.MOVE_DROP : DND.DragMotionResult.NO_DROP),
+            acceptDrop: source => {
+                if (accepts(source))
+                    return this._addApp(source, -1);
+                return isOwn(source);
+            },
+        };
+        this._delegate = {
+            handleDragOver: source => (isOwn(source) || accepts(source)
+                ? DND.DragMotionResult.MOVE_DROP : DND.DragMotionResult.NO_DROP),
+            acceptDrop: source => {
+                if (accepts(source))
+                    return this._addApp(source, -1);
+                if (!isOwn(source))
+                    return false;
+                this.emit('app-removed', source);
+                this.close();
+                return true;
+            },
+        };
+
+        // Connected after the Section's own drag handlers, which still
+        // touch the grid on drag-end.
+        for (const tile of tiles) {
+            tile.draggable.connect('drag-begin', () => this._trackDrag(tile, false));
+            tile.draggable.connect('drag-end', () => {
+                this._stopTrackingDrag();
+                if (this._hiddenForDrag) {
+                    this.emit('closed');
+                    this.destroy();
+                }
+            });
+        }
+        this._dropped = false;
+        if (dragSource)
+            this._trackDrag(dragSource, true);
+        this.connect('destroy', () => this._stopTrackingDrag());
 
         // Clicks outside the panel close the popup. Don't stop propagation
         // on the panel itself: a signal handler that consumes a press makes
@@ -421,15 +678,24 @@ const FolderPopup = GObject.registerClass({
         // St.Button click gesture of the tile underneath.
         this.connect('button-release-event', (_actor, event) => {
             const [x, y] = event.get_coords();
-            const [px, py] = this._panel.get_transformed_position();
-            const [pw, ph] = this._panel.get_transformed_size();
-            if (x >= px && x < px + pw && y >= py && y < py + ph)
+            if (isInside(this._panel, x, y))
                 return Clutter.EVENT_PROPAGATE;
+            this._finishRename();
+            this.close();
+            return Clutter.EVENT_STOP;
+        });
+        // Escape closes the folder, as in the overview. Without keyboard
+        // focus inside, the desktop's key catcher handles it.
+        this.connect('key-press-event', (_actor, event) => {
+            if (event.get_key_symbol() !== Clutter.KEY_Escape)
+                return Clutter.EVENT_PROPAGATE;
+            this._finishRename();
             this.close();
             return Clutter.EVENT_STOP;
         });
 
-        // Animate in.
+        if (!animate)
+            return;
         this.opacity = 0;
         this._panel.set_pivot_point(0.5, 0.5);
         this._panel.set_scale(0.9, 0.9);
@@ -451,9 +717,142 @@ const FolderPopup = GObject.registerClass({
         this._panel.set_style(`max-height: ${Math.max(200, height)}px;`);
     }
 
+    get renaming() {
+        return this._entry !== null;
+    }
+
+    get closing() {
+        return this._closing;
+    }
+
+    _addApp(source, index) {
+        this._dropped = true;
+        this.emit('app-added', source, index);
+        return true;
+    }
+
+    /**
+     * While a drag is on, leaving the panel closes the folder after
+     * POPDOWN_DIALOG_TIMEOUT and coming back cancels that. A popup opened
+     * by holding an app over the folder opens away from the pointer, so for
+     * it the countdown only starts once the pointer has been inside.
+     */
+    _trackDrag(source, external) {
+        let entered = !external;
+        this._dragMonitor = {
+            dragMotion: event => {
+                if (isInside(this._panel, event.x, event.y)) {
+                    entered = true;
+                    this._removePopdownTimeout();
+                } else if (entered && !this._popdownId) {
+                    this._popdownId = GLib.timeout_add(GLib.PRIORITY_DEFAULT,
+                        POPDOWN_DIALOG_TIMEOUT, () => {
+                            this._popdownId = 0;
+                            this._popdownForDrag(external);
+                            return GLib.SOURCE_REMOVE;
+                        });
+                }
+                return DND.DragMotionResult.CONTINUE;
+            },
+        };
+        DND.addDragMonitor(this._dragMonitor);
+        if (external) {
+            source.draggable.connectObject('drag-end', () => {
+                this._stopTrackingDrag();
+                if (!this._dropped)
+                    this.close();
+            }, this);
+        }
+    }
+
+    _removePopdownTimeout() {
+        if (this._popdownId)
+            GLib.source_remove(this._popdownId);
+        this._popdownId = 0;
+    }
+
+    _stopTrackingDrag() {
+        this._removePopdownTimeout();
+        if (!this._dragMonitor)
+            return;
+        DND.removeDragMonitor(this._dragMonitor);
+        this._dragMonitor = null;
+    }
+
+    /**
+     * Close under a drag. A drag that started inside must keep its tile
+     * alive until it ends, so hide rather than destroy (hidden actors are
+     * not picked as drop targets); drag-end destroys the popup.
+     */
+    _popdownForDrag(external) {
+        this._stopTrackingDrag();
+        this._finishRename();
+        if (external) {
+            this.close();
+            return;
+        }
+        this._closing = true;
+        this._hiddenForDrag = true;
+        this.reactive = false;
+        this._panel.ease({
+            scale_x: 0.9,
+            scale_y: 0.9,
+            duration: FOLDER_ANIMATION_TIME,
+            mode: Clutter.AnimationMode.EASE_IN_QUAD,
+        });
+        this.ease({
+            opacity: 0,
+            duration: FOLDER_ANIMATION_TIME,
+            mode: Clutter.AnimationMode.EASE_IN_QUAD,
+            onComplete: () => this.hide(),
+        });
+    }
+
+    _startRename() {
+        if (this._entry || this._closing)
+            return;
+        this._entry = new St.Entry({
+            style_class: 'desktop-launcher-folder-entry',
+            text: this.folder.name,
+            can_focus: true,
+        });
+        this._entry.clutter_text.connect('activate', () => this._finishRename());
+        this._entry.clutter_text.connect('key-press-event', (_text, event) => {
+            if (event.get_key_symbol() !== Clutter.KEY_Escape)
+                return Clutter.EVENT_PROPAGATE;
+            this._finishRename();
+            this.close();
+            return Clutter.EVENT_STOP;
+        });
+        this._title.hide();
+        this._header.insert_child_at_index(this._entry, 0);
+
+        this._grab = Main.pushModal(this, {actionMode: Shell.ActionMode.POPUP});
+        this._entry.clutter_text.grab_key_focus();
+        this._entry.clutter_text.set_selection(0, -1);
+    }
+
+    /** Leave the entry, keeping a non-empty new name. */
+    _finishRename() {
+        if (!this._entry)
+            return;
+        const name = this._entry.text.trim();
+        this._entry.destroy();
+        this._entry = null;
+        if (this._grab) {
+            Main.popModal(this._grab);
+            this._grab = null;
+        }
+        if (name)
+            this._title.text = name;
+        this._title.show();
+        this.emit('rename-finished', name);
+    }
+
     close() {
         if (this._closing)
             return;
+        this._stopTrackingDrag();
         this._closing = true;
         this.reactive = false;
         this._panel.ease({
@@ -481,18 +880,29 @@ const FolderPopup = GObject.registerClass({
  * Clutter.FlowLayout cannot report a reliable height inside a scroll view,
  * so the owning LauncherLayer computes the columns from its own width.
  *
- * The grid is a Shell DND drop target. Dragging one of its own tiles
- * reorders live (the faded source tile acts as the placeholder) and emits
- * 'reordered' on drop; a drop of a tile from another section emits
- * 'external-drop' with the source tile and the target index.
+ * The grid is a Shell DND drop target that works like the overview's app
+ * grid. Hovering a tile's edge (or the empty space after the last tile)
+ * moves the dragged tile there after DELAYED_MOVE_TIMEOUT; its empty slot
+ * travels with it. A drop emits 'reordered'. Tiles from elsewhere that
+ * acceptsExternal(source) allows drop in with 'external-drop' (source,
+ * index); with externalPlaceholder an empty slot shows where, moving the
+ * same way. Dropping on the middle of a tile that canMerge(source, tile)
+ * allows emits 'merge' instead; holding over a folder tile there emits
+ * 'drop-target-held'.
  */
 const Section = GObject.registerClass({
     Signals: {
         'reordered': {},
         'external-drop': {param_types: [GObject.TYPE_JSOBJECT, GObject.TYPE_INT]},
+        'merge': {param_types: [GObject.TYPE_JSOBJECT, GObject.TYPE_JSOBJECT]},
+        'drop-target-held': {param_types: [GObject.TYPE_JSOBJECT, GObject.TYPE_JSOBJECT]},
     },
 }, class Section extends St.BoxLayout {
-    _init(title, tiles, showTitle, columns, acceptsExternal = () => false) {
+    _init(title, tiles, showTitle, columns, {
+        acceptsExternal = () => false,
+        canMerge = () => false,
+        externalPlaceholder = false,
+    } = {}) {
         super._init({
             orientation: Clutter.Orientation.VERTICAL,
             x_expand: true,
@@ -501,7 +911,17 @@ const Section = GObject.registerClass({
         this._columns = Math.max(1, columns);
         this._tiles = [];
         this._acceptsExternal = acceptsExternal;
+        this._canMerge = canMerge;
+        this._externalPlaceholder = externalPlaceholder;
         this._orderBeforeDrag = null;
+        this._placeholder = null;
+        this._delayedMove = null;
+        this._hoverTile = null;
+        this._previewId = 0;
+        this._springId = 0;
+        this._dragSource = null;
+        this._dragMonitor = null;
+        this.connect('destroy', () => this._endDrag());
 
         if (showTitle && title) {
             this.add_child(new St.Label({
@@ -538,12 +958,13 @@ const Section = GObject.registerClass({
 
         tiles.forEach((tile, i) => {
             this._tiles.push(tile);
-            this._layout.attach(tile, i % this._columns, Math.floor(i / this._columns), 1, 1);
+            this._attach(tile, i);
             if (tile.draggable) {
                 tile.draggable.connect('drag-begin', () => {
                     this._orderBeforeDrag = [...this._tiles];
                 });
                 tile.draggable.connect('drag-end', (_d, _time, success) => {
+                    this._endDrag();
                     if (!success && this._orderBeforeDrag)
                         this._setOrder(this._orderBeforeDrag);
                     this._orderBeforeDrag = null;
@@ -554,58 +975,285 @@ const Section = GObject.registerClass({
 
     /** Keys (app ids / folder:ID) in current display order. */
     getKeys() {
-        return this._tiles.map(t => t.key);
+        return this._tiles.filter(t => t !== this._placeholder).map(t => t.key);
+    }
+
+    _attach(tile, i) {
+        this._layout.attach(tile, i % this._columns, Math.floor(i / this._columns), 1, 1);
     }
 
     _setOrder(tiles) {
-        if (tiles.every((t, i) => t === this._tiles[i]))
+        if (tiles.length === this._tiles.length &&
+            tiles.every((t, i) => t === this._tiles[i]))
             return;
-        this._tiles = tiles;
         // GridLayout has no public "move child"; re-attach in order.
-        for (const tile of tiles)
-            this._grid.remove_child(tile);
-        tiles.forEach((tile, i) => {
-            this._layout.attach(tile, i % this._columns, Math.floor(i / this._columns), 1, 1);
-        });
+        for (const tile of this._tiles) {
+            if (tile.get_parent() === this._grid)
+                this._grid.remove_child(tile);
+        }
+        this._tiles = tiles;
+        tiles.forEach((tile, i) => this._attach(tile, i));
     }
 
-    /** Grid-relative point -> tile index (clamped). */
-    _indexAt(x, y, count) {
-        const side = this._tiles[0]?.width ?? tileSide(64, true);
-        const step = side + GRID_SPACING;
-        const col = Math.min(this._columns - 1, Math.max(0, Math.floor(x / step)));
-        const row = Math.max(0, Math.floor(y / step));
-        return Math.min(count - 1, row * this._columns + col);
+    _moveTile(tile, to) {
+        const tiles = this._tiles.filter(t => t !== tile);
+        tiles.splice(Math.min(to, tiles.length), 0, tile);
+        this._setOrder(tiles);
+    }
+
+    _metrics() {
+        const side = this._tiles.find(t => t !== this._placeholder)?.width ||
+            tileSide(64, true);
+        return {side, step: side + GRID_SPACING};
+    }
+
+    /**
+     * IconGrid.getDropTarget for this single-page grid: the tile index
+     * under the grid-relative point and where on it, or -1 for the empty
+     * space after the last tile.
+     */
+    _getDropTarget(x, y) {
+        const n = this._tiles.length;
+        const {side, step} = this._metrics();
+        const half = GRID_SPACING / 2;
+        const rows = Math.ceil(n / this._columns);
+        if (n === 0)
+            return [-1, DragLocation.EMPTY_SPACE];
+        if (y < -half || y > rows * step - half)
+            return [-1, DragLocation.INVALID];
+
+        const row = Math.max(0, Math.floor((y + half) / step));
+        const col = Math.min(this._columns - 1, Math.max(0, Math.floor((x + half) / step)));
+        const index = row * this._columns + col;
+        if (index >= n)
+            return [-1, DragLocation.EMPTY_SPACE];
+
+        const x1 = col * step;
+        if (x < x1 + DIVIDER_LEEWAY)
+            return [index, DragLocation.START_EDGE];
+        if (x > x1 + side - DIVIDER_LEEWAY)
+            return [index, DragLocation.END_EDGE];
+        return [index, DragLocation.ON_ICON];
+    }
+
+    /**
+     * BaseAppView._getDropTarget: on an edge the drag can't push the
+     * hovered tile away from, aim at the neighbour that can be pushed.
+     */
+    _adjustForReflow(sourceIndex, index, location) {
+        if (index === -1 || sourceIndex === index)
+            return [index, location];
+        const col = index % this._columns;
+        const reflowStart = sourceIndex !== -1 && sourceIndex < index;
+        if (location === DragLocation.START_EDGE && reflowStart && col > 0)
+            return [index - 1, DragLocation.END_EDGE];
+        if (location === DragLocation.END_EDGE && !reflowStart && col < this._columns - 1)
+            return [index + 1, DragLocation.START_EDGE];
+        return [index, location];
+    }
+
+    /** The tile the point is on (not between tiles) if source may merge. */
+    _mergeTargetAt(source, x, y) {
+        const [index, location] = this._getDropTarget(x, y);
+        if (location !== DragLocation.ON_ICON)
+            return null;
+        const {side, step} = this._metrics();
+        const y1 = Math.floor(index / this._columns) * step;
+        const tile = this._tiles[index];
+        if (y < y1 || y > y1 + side || tile === source || tile === this._placeholder ||
+            !this._canMerge(source, tile))
+            return null;
+        return tile;
+    }
+
+    /** BaseAppView._maybeMoveItem: schedule moving item to the point. */
+    _maybeMoveItem(item, x, y) {
+        const from = this._tiles.indexOf(item);
+        const [index, location] = this._adjustForReflow(from, ...this._getDropTarget(x, y));
+        const to = index === -1 ? this._tiles.length - 1 : index;
+        if (location === DragLocation.INVALID || location === DragLocation.ON_ICON ||
+            this._tiles[to] === item) {
+            this._removeDelayedMove();
+            return;
+        }
+        if (this._delayedMove?.index === to)
+            return;
+        this._removeDelayedMove();
+        const id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, DELAYED_MOVE_TIMEOUT, () => {
+            this._delayedMove = null;
+            this._moveTile(item, to);
+            return GLib.SOURCE_REMOVE;
+        });
+        this._delayedMove = {item, index: to, id};
+    }
+
+    _removeDelayedMove() {
+        if (this._delayedMove)
+            GLib.source_remove(this._delayedMove.id);
+        this._delayedMove = null;
+    }
+
+    /** A drop before the delayed move fired still lands there. */
+    _flushDelayedMove() {
+        if (!this._delayedMove)
+            return;
+        const {item, index} = this._delayedMove;
+        this._removeDelayedMove();
+        this._moveTile(item, index);
+    }
+
+    /**
+     * Show the empty slot for an external drop right away, so the grid
+     * doesn't grow (and a centred one shift) under the pointer later.
+     */
+    reserveExternalSlot() {
+        this._ensurePlaceholder();
+    }
+
+    _ensurePlaceholder() {
+        if (this._placeholder)
+            return;
+        const {side} = this._metrics();
+        this._placeholder = new St.Widget({width: side, height: side});
+        this._tiles.push(this._placeholder);
+        this._attach(this._placeholder, this._tiles.length - 1);
+    }
+
+    _removePlaceholder() {
+        if (!this._placeholder)
+            return;
+        const placeholder = this._placeholder;
+        this._placeholder = null;
+        this._setOrder(this._tiles.filter(t => t !== placeholder));
+        placeholder.destroy();
+    }
+
+    /**
+     * Highlight the tile a drop would merge into, as the overview's icons
+     * do: a folder at once, an app after FOLDER_PREVIEW_DELAY with the
+     * folder preview.
+     */
+    _setHover(tile) {
+        if (tile === this._hoverTile)
+            return;
+        if (this._hoverTile) {
+            this._hoverTile.remove_style_pseudo_class('drop');
+            this._hoverTile.hideFolderPreview?.();
+        }
+        for (const id of [this._previewId, this._springId]) {
+            if (id)
+                GLib.source_remove(id);
+        }
+        this._previewId = this._springId = 0;
+        this._hoverTile = tile;
+        if (!tile)
+            return;
+
+        if (tile instanceof FolderTile) {
+            tile.add_style_pseudo_class('drop');
+            this._springId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FOLDER_SPRING_DELAY, () => {
+                this._springId = 0;
+                this.emit('drop-target-held', tile, this._dragSource);
+                return GLib.SOURCE_REMOVE;
+            });
+        } else {
+            this._previewId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, FOLDER_PREVIEW_DELAY, () => {
+                this._previewId = 0;
+                tile.add_style_pseudo_class('drop');
+                tile.showFolderPreview();
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+    }
+
+    /**
+     * DND has no "drag left" notification for targets: a drag monitor
+     * stops hovering and pending moves once the pointer leaves the section,
+     * and the source's drag-end cleans up (also when a drag is cancelled).
+     */
+    _beginDrag(source) {
+        if (this._dragSource === source)
+            return;
+        if (this._dragSource)
+            this._endDrag();
+        this._dragSource = source;
+        this._dragMonitor = {
+            dragMotion: event => {
+                if (!this.contains(event.targetActor)) {
+                    this._setHover(null);
+                    this._removeDelayedMove();
+                }
+                return DND.DragMotionResult.CONTINUE;
+            },
+        };
+        DND.addDragMonitor(this._dragMonitor);
+        source.draggable.connectObject('drag-end', () => this._endDrag(), this);
+    }
+
+    _endDrag() {
+        this._removeDelayedMove();
+        this._setHover(null);
+        this._removePlaceholder();
+        if (this._dragMonitor) {
+            DND.removeDragMonitor(this._dragMonitor);
+            this._dragMonitor = null;
+        }
+        this._dragSource?.draggable.disconnectObject(this);
+        this._dragSource = null;
     }
 
     handleDragOver(source, _actor, x, y) {
-        if (this._tiles.includes(source)) {
-            const from = this._tiles.indexOf(source);
-            const to = this._indexAt(x, y, this._tiles.length);
-            if (to !== from) {
-                const tiles = [...this._tiles];
-                tiles.splice(from, 1);
-                tiles.splice(to, 0, source);
-                this._setOrder(tiles);
-            }
+        const own = this._tiles.includes(source);
+        if (!own && !this._acceptsExternal(source))
+            return DND.DragMotionResult.NO_DROP;
+        this._beginDrag(source);
+
+        const target = this._mergeTargetAt(source, x, y);
+        this._setHover(target);
+        if (target) {
+            this._removeDelayedMove();
             return DND.DragMotionResult.MOVE_DROP;
         }
-        if (this._acceptsExternal(source))
+        if (!own && !this._externalPlaceholder)
             return DND.DragMotionResult.COPY_DROP;
-        return DND.DragMotionResult.NO_DROP;
+        if (!own)
+            this._ensurePlaceholder();
+        this._maybeMoveItem(own ? source : this._placeholder, x, y);
+        return DND.DragMotionResult.MOVE_DROP;
     }
 
     acceptDrop(source, _actor, x, y) {
-        if (this._tiles.includes(source)) {
+        const own = this._tiles.includes(source);
+        if (!own && !this._acceptsExternal(source))
+            return false;
+
+        const target = this._mergeTargetAt(source, x, y);
+        this._setHover(null);
+        if (target) {
+            this._removeDelayedMove();
+            this._removePlaceholder();
+            this.emit('merge', source, target);
+            return true;
+        }
+
+        this._flushDelayedMove();
+        if (own) {
             this._orderBeforeDrag = null;
             this.emit('reordered');
             return true;
         }
-        if (this._acceptsExternal(source)) {
-            this.emit('external-drop', source, this._indexAt(x, y, this._tiles.length + 1));
-            return true;
+
+        let index;
+        if (this._placeholder) {
+            index = this._tiles.indexOf(this._placeholder);
+            this._removePlaceholder();
+        } else {
+            const [i, location] = this._getDropTarget(x, y);
+            index = i === -1 ? this._tiles.length
+                : i + (location === DragLocation.END_EDGE ? 1 : 0);
         }
-        return false;
+        this.emit('external-drop', source, index);
+        return true;
     }
 });
 
@@ -614,7 +1262,7 @@ const Section = GObject.registerClass({
  */
 const LauncherLayer = GObject.registerClass(
 class LauncherLayer extends St.Widget {
-    _init(monitorIndex, settings, folderSettings) {
+    _init(monitorIndex, settings, folderSettings, queueRebuild) {
         super._init({
             name: `desktop-launcher-${monitorIndex}`,
             style_class: 'desktop-launcher-layer',
@@ -628,8 +1276,10 @@ class LauncherLayer extends St.Widget {
         this.monitorIndex = monitorIndex;
         this._settings = settings;
         this._folderSettings = folderSettings;
+        this._queueRebuild = queueRebuild;
         this._columns = 0;
         this._popup = null;
+        this._rebuildPending = false;
         this._appsSection = null;
 
         this._scroll = new St.ScrollView({
@@ -690,7 +1340,18 @@ class LauncherLayer extends St.Widget {
 
     /** Recreate all tiles from the current app list and settings. */
     rebuild() {
-        this._popup?.destroy();
+        // Don't throw away a name being typed; rebuild when editing ends.
+        if (this._popup?.renaming) {
+            this._rebuildPending = true;
+            return;
+        }
+        // An open folder stays open across the rebuild.
+        const openFolderId = this._popup && !this._popup.closing
+            ? this._popup.folder.id : null;
+        // A closing popup finishes by itself; one hidden for a drag out of
+        // it holds the dragged tile and must live until the drag ends.
+        if (!this._popup?.closing)
+            this._popup?.destroy();
         this._popup = null;
         this._appsSection = null;
         this._content.destroy_all_children();
@@ -725,9 +1386,10 @@ class LauncherLayer extends St.Widget {
 
         if (favorites.length > 0) {
             const tiles = favorites.map(app => new AppTile(app, dragParams));
-            const section = new Section(_('Favourites'), tiles, showTitles,
-                this._columns, source => source instanceof AppTile &&
-                    !appFavorites.isFavorite(source.key));
+            const section = new Section(_('Favourites'), tiles, showTitles, this._columns, {
+                acceptsExternal: source => source instanceof AppTile &&
+                    !appFavorites.isFavorite(source.key),
+            });
             section.connect('reordered', () => {
                 // Favourites order lives in GNOME's favorite-apps list.
                 section.getKeys().forEach((id, pos) => {
@@ -768,11 +1430,107 @@ class LauncherLayer extends St.Widget {
                 .sort((a, b) => order.get(a.key) - order.get(b.key));
             tiles = [...known, ...tiles.filter(t => !order.has(t.key))];
         }
-        this._appsSection = new Section(_('All Apps'), tiles, showTitles, this._columns);
+        // As in the overview: apps dragged out of an open folder drop
+        // anywhere on All Apps (an empty slot shows where); an All Apps app
+        // dropped on the middle of an app makes a folder, on a folder goes
+        // in. Holding it over a folder also opens the folder.
+        this._appsSection = new Section(_('All Apps'), tiles, showTitles, this._columns, {
+            acceptsExternal: source => source instanceof AppTile && source.folderId !== null,
+            externalPlaceholder: true,
+            canMerge: (source, target) => source instanceof AppTile &&
+                this._appsSection._tiles.includes(source) &&
+                (target instanceof AppTile || target instanceof FolderTile),
+        });
         this._appsSection.connect('reordered', () => {
             this._settings.set_strv('app-order', this._appsSection.getKeys());
         });
+        this._appsSection.connect('external-drop', (_s, source, index) => {
+            const keys = this._appsSection.getKeys().filter(k => k !== source.key);
+            keys.splice(index, 0, source.key);
+            this._settings.set_strv('app-order', keys);
+            removeAppFromFolder(this._folderSettings, source.folderId, source.key);
+        });
+        this._appsSection.connect('merge', (_s, source, target) => this._merge(source, target));
+        this._appsSection.connect('drop-target-held', (_s, target, source) => {
+            if (target instanceof FolderTile)
+                this._openFolder(target.folder, tileParams, {dragSource: source});
+        });
         this._content.add_child(this._appsSection);
+
+        const openFolder = folders.find(f => f.id === openFolderId);
+        if (openFolder)
+            this._openFolder(openFolder, tileParams, {animate: false});
+    }
+
+    /**
+     * Drop of an app tile on the middle of another tile in All Apps: into
+     * the folder, or a new folder of both apps where the target app was.
+     * Settings writes only; the rebuild they trigger runs once the drag has
+     * finished.
+     */
+    _merge(source, target) {
+        if (target instanceof FolderTile) {
+            this._moveIntoFolder(source, target.folder.id);
+            return;
+        }
+        if (source.folderId)
+            removeAppFromFolder(this._folderSettings, source.folderId, source.key);
+        const id = createFolder(this._folderSettings, [target.app, source.app]);
+        const keys = this._appsSection.getKeys()
+            .map(k => (k === target.key ? `folder:${id}` : k));
+        this._settings.set_strv('app-order', keys.filter(k => k !== source.key));
+    }
+
+    _moveIntoFolder(source, folderId) {
+        if (source.folderId === folderId)
+            return;
+        if (source.folderId)
+            removeAppFromFolder(this._folderSettings, source.folderId, source.key);
+        addAppToFolder(this._folderSettings, folderId, source.key);
+        this._settings.set_strv('app-order',
+            this._appsSection.getKeys().filter(k => k !== source.key));
+    }
+
+    /** An app dragged out of a folder and dropped beside it: last in All Apps. */
+    _takeOutOfFolder(source) {
+        const keys = this._appsSection.getKeys().filter(k => k !== source.key);
+        this._settings.set_strv('app-order', [...keys, source.key]);
+        removeAppFromFolder(this._folderSettings, source.folderId, source.key);
+    }
+
+    _renameFolder(id, name) {
+        const folder = getFolder(this._folderSettings, id);
+        if (folder.get_string('name') === name && !folder.get_boolean('translate'))
+            return;
+        folder.delay();
+        folder.set_string('name', name);
+        folder.set_boolean('translate', false);
+        folder.apply();
+    }
+
+    _runPendingRebuild() {
+        if (!this._rebuildPending)
+            return;
+        this._rebuildPending = false;
+        this._queueRebuild();
+    }
+
+    closeFolder() {
+        this._popup?.close();
+    }
+
+    /** Type-to-search replaces the grid while it shows results. */
+    setSearchActive(active) {
+        if (active)
+            this._popup?.close();
+        this._scroll.ease({
+            opacity: active ? 0 : 255,
+            duration: FOLDER_ANIMATION_TIME,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: () => (this._scroll.visible = !active),
+        });
+        if (!active)
+            this._scroll.visible = true;
     }
 
     /** True when the All Apps grid already shows the saved order. */
@@ -784,17 +1542,373 @@ class LauncherLayer extends St.Widget {
             known.every((k, i) => k === saved.filter(x => keys.includes(x))[i]);
     }
 
-    _openFolder(folder, tileParams) {
-        if (this._popup)
+    _openFolder(folder, tileParams, {animate = true, dragSource = null} = {}) {
+        // A popup hidden for a drag out of it stays alive (it holds the
+        // dragged tile) until that drag ends; another folder may open
+        // meanwhile.
+        if (this._popup && !(dragSource && this._popup.closing))
             return;
         const columns = Math.max(1, Math.min(this._columns - 2, 6));
-        this._popup = new FolderPopup(folder, tileParams, columns);
-        this._popup.connect('closed', () => {
-            this._popup = null;
+        const popup = new FolderPopup(folder, tileParams, columns, {animate, dragSource});
+        this._popup = popup;
+        popup.connect('closed', () => {
+            if (this._popup === popup)
+                this._popup = null;
+            this._runPendingRebuild();
         });
-        this._popup.setMaxHeight(
+        popup.connect('rename-finished', (_p, name) => {
+            if (name)
+                this._renameFolder(folder.id, name);
+            this._runPendingRebuild();
+        });
+        popup.connect('reordered', (_p, keys) =>
+            setFolderOrder(this._folderSettings, folder.id, keys));
+        popup.connect('app-added', (_p, source, index) => {
+            const order = folder.apps.map(app => app.get_id());
+            order.splice(index < 0 ? order.length : index, 0, source.key);
+            this._moveIntoFolder(source, folder.id);
+            setFolderOrder(this._folderSettings, folder.id, order);
+        });
+        popup.connect('app-removed', (_p, source) => this._takeOutOfFolder(source));
+        popup.setMaxHeight(
             this.height - 2 * this._settings.get_int('margin') - 48);
-        this.add_child(this._popup);
+        // Beside the layer, not in it, covering the whole work area: see
+        // BLUR_MY_SHELL_TARGET. It still belongs to this layer.
+        popup.add_constraint(new Clutter.BindConstraint({
+            source: this,
+            coordinate: Clutter.BindCoordinate.ALL,
+        }));
+        this.connectObject('destroy', () => popup.destroy(), popup);
+        this.get_parent().add_child(popup);
+    }
+});
+
+/** searchController.js: the search terms in a string, [] when blank. */
+function getTermsForSearchString(searchString) {
+    searchString = searchString.trim();
+    if (searchString === '')
+        return [];
+    return searchString.split(/\s+/);
+}
+
+/**
+ * Run fn, returning it with the ids of the signal handlers it connected on
+ * the given objects, so they can be disconnected later.
+ */
+function trackConnections(objects, fn) {
+    const tracked = [];
+    for (const obj of objects) {
+        obj.connect = (...args) => {
+            const id = Object.getPrototypeOf(obj).connect.apply(obj, args);
+            tracked.push([obj, id]);
+            return id;
+        };
+    }
+    try {
+        return [fn(), tracked];
+    } finally {
+        for (const obj of objects)
+            delete obj.connect;
+    }
+}
+
+/**
+ * Type-to-search on the desktop, with the overview's own search: the
+ * Shell's SearchResultsView (apps, plus every search provider: Files,
+ * Settings, Calculator, ...) behind a search entry that only appears once
+ * something is typed. Key handling follows searchController.js.
+ *
+ * Typing needs the keyboard, which normally belongs to the focused
+ * window. keyCatcher, a tiny actor in the launcher, takes the stage key
+ * focus whenever the desktop is what the user is looking at: no window
+ * focused, or a click on the desktop. Setting a stage key focus makes the
+ * Shell unfocus the window (shell-global.c), and focusing a window clears
+ * it again. A printable key on keyCatcher starts the search.
+ */
+const DesktopSearch = GObject.registerClass({
+    Properties: {
+        'active': GObject.ParamSpec.boolean('active', null, null,
+            GObject.ParamFlags.READABLE, false),
+    },
+    // Escape pressed while the desktop has the keyboard (closes a folder).
+    Signals: {'escape': {}},
+}, class DesktopSearch extends St.BoxLayout {
+    _init() {
+        super._init({
+            // bms-keyboard-surface: see BLUR_MY_SHELL_TARGET.
+            style_class: `desktop-launcher-search ${BLUR_MY_SHELL_TARGET}`,
+            orientation: Clutter.Orientation.VERTICAL,
+            reactive: true,
+            x_expand: true,
+            y_expand: true,
+            visible: false,
+        });
+
+        this._active = false;
+        this._syncId = 0;
+
+        this.keyCatcher = new Clutter.Actor({reactive: true});
+        this.keyCatcher.connect('key-press-event', (_actor, event) => {
+            if (event.get_key_symbol() === Clutter.KEY_Escape) {
+                this.emit('escape');
+                return Clutter.EVENT_STOP;
+            }
+            if (!this._shouldTriggerSearch(event.get_key_symbol()))
+                return Clutter.EVENT_PROPAGATE;
+            this._startSearch(event);
+            return Clutter.EVENT_STOP;
+        });
+
+        this._entry = new St.Entry({
+            style_class: 'search-entry',
+            hint_text: _('Type to search'),
+            track_hover: true,
+            can_focus: true,
+            x_align: Clutter.ActorAlign.CENTER,
+        });
+        ShellEntry.addContextMenu(this._entry);
+        this._entry.set_primary_icon(new St.Icon({
+            style_class: 'search-entry-icon',
+            icon_name: 'edit-find-symbolic',
+        }));
+        this._clearIcon = new St.Icon({
+            style_class: 'search-entry-icon',
+            icon_name: 'edit-clear-symbolic',
+        });
+        this._entry.connect('secondary-icon-clicked', () => this.reset());
+        this.add_child(this._entry);
+
+        this._text = this._entry.clutter_text;
+        this._text.connect('text-changed', () => this._onTextChanged());
+        this._text.connect('key-press-event', (entry, event) => this._onEntryKeyPress(entry, event));
+        this._text.connect('key-focus-in', () => this._results.highlightDefault(true));
+        this._text.connect('key-focus-out', () => this._results.highlightDefault(false));
+
+        // The view connects to global objects for good (the overview never
+        // destroys its own); keep the ids to disconnect on destroy.
+        const appSystem = Shell.AppSystem.get_default();
+        const parental = ParentalControlsManager.getDefault();
+        [this._results, this._globalHandlers] = trackConnections([appSystem, parental],
+            () => new Search.SearchResultsView());
+        this.add_child(this._results);
+        global.focus_manager.add_group(this._results);
+
+        // Upstream race: when the installed apps change, the view replaces
+        // its search providers and destroys their result displays, but a
+        // search still running for an old provider then updates its
+        // destroyed display. Drop results of providers that are gone.
+        const updateResults = this._results._updateResults.bind(this._results);
+        this._results._updateResults = (provider, ...args) => {
+            if (this._results._providers.includes(provider))
+                return updateResults(provider, ...args);
+            provider.searchInProgress = false;
+            return Promise.resolve();
+        };
+
+        // Keys pressed on a focused result: Escape and typing go back to
+        // the search, as the overview's stage handler does.
+        this.connect('key-press-event', (_actor, event) => {
+            const symbol = event.get_key_symbol();
+            if (symbol === Clutter.KEY_Escape) {
+                this.reset();
+                return Clutter.EVENT_STOP;
+            }
+            if (this._shouldTriggerSearch(symbol)) {
+                this._startSearch(event);
+                return Clutter.EVENT_STOP;
+            }
+            return Clutter.EVENT_PROPAGATE;
+        });
+        // A click beside the results closes the search.
+        this.connect('button-release-event', (_actor, event) => {
+            if (global.stage.get_event_actor(event) !== this)
+                return Clutter.EVENT_PROPAGATE;
+            this.reset();
+            return Clutter.EVENT_STOP;
+        });
+
+        this.connect('destroy', () => this._onDestroy());
+    }
+
+    get active() {
+        return this._active;
+    }
+
+    enable() {
+        // Activating a remote result ends in Main.overview.toggle(), which
+        // here would open the overview; close the search instead. Super
+        // still opens the overview.
+        const overview = Main.overview;
+        const toggle = overview.toggle;
+        overview.toggle = () => {
+            if (!overview.visible && this._active && this._isOwnEvent())
+                this.reset();
+            else
+                toggle.call(overview);
+        };
+        this._restoreToggle = () => delete overview.toggle;
+
+        global.display.connectObject('notify::focus-window', () => this._queueSync(), this);
+        // Clicking a window takes the keyboard away: close the search.
+        global.stage.connectObject('notify::key-focus', () => {
+            if (this._active && !global.stage.key_focus)
+                this.reset();
+        }, this);
+        Main.overview.connectObject(
+            'showing', () => this.reset(),
+            'hidden', () => this._queueSync(),
+            this);
+        this._queueSync();
+    }
+
+    disable() {
+        this._restoreToggle?.();
+        this._restoreToggle = null;
+        global.display.disconnectObject(this);
+        global.stage.disconnectObject(this);
+        Main.overview.disconnectObject(this);
+        if (this._syncId)
+            GLib.source_remove(this._syncId);
+        this._syncId = 0;
+        this.reset();
+        if (global.stage.key_focus === this.keyCatcher)
+            global.stage.set_key_focus(null);
+    }
+
+    _onDestroy() {
+        this.disable();
+        this._results._cancellable.cancel();
+        this._results._clearSearchTimeout();
+        for (const [obj, id] of this._globalHandlers)
+            obj.disconnect(id);
+        this._globalHandlers = [];
+        this.keyCatcher.destroy();
+    }
+
+    /** Whether the event being handled comes from the search UI itself. */
+    _isOwnEvent() {
+        const event = Clutter.get_current_event();
+        if (!event)
+            return false;
+        const type = event.type();
+        if ((type === Clutter.EventType.KEY_PRESS || type === Clutter.EventType.KEY_RELEASE) &&
+            [Clutter.KEY_Super_L, Clutter.KEY_Super_R].includes(event.get_key_symbol()))
+            return false;
+        const actor = global.stage.get_event_actor(event);
+        return actor !== null && this.contains(actor);
+    }
+
+    /** Take the keyboard for type-to-search, if nothing else wants it. */
+    claimKeyboard() {
+        if (!this.keyCatcher.mapped || Main.overview.visible || Main.modalCount > 0)
+            return;
+        const focus = global.stage.key_focus;
+        if (focus && focus !== global.stage && !this.contains(focus))
+            return;
+        if (!this._active)
+            global.stage.set_key_focus(this.keyCatcher);
+    }
+
+    /**
+     * Focus changes come in steps (the old window loses focus before the
+     * next one gets it), so look once they have settled: with no window
+     * focused the desktop takes the keyboard; a focused window ends the
+     * search.
+     */
+    _queueSync() {
+        if (this._syncId)
+            return;
+        this._syncId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._syncId = 0;
+            if (global.display.focus_window)
+                this.reset();
+            else
+                this.claimKeyboard();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _setActive(active) {
+        if (this._active === active)
+            return;
+        this._active = active;
+        this.visible = active;
+        this.notify('active');
+    }
+
+    _shouldTriggerSearch(symbol) {
+        if (symbol === Clutter.KEY_Multi_key)
+            return true;
+        if (symbol === Clutter.KEY_BackSpace && this._active)
+            return true;
+        const unicode = Clutter.keysym_to_unicode(symbol);
+        if (unicode === 0)
+            return false;
+        return getTermsForSearchString(String.fromCharCode(unicode)).length > 0;
+    }
+
+    _startSearch(event) {
+        this._setActive(true);
+        global.stage.set_key_focus(this._text);
+        this._text.event(event, false);
+    }
+
+    /** Clear and hide the search; the desktop keeps the keyboard. */
+    reset() {
+        const hadFocus = global.stage.key_focus !== null &&
+            this.contains(global.stage.key_focus);
+        this._entry.text = '';
+        this._text.set_selection(0, 0);
+        this._setActive(false);
+        if (hadFocus && !global.display.focus_window)
+            this.claimKeyboard();
+    }
+
+    _onTextChanged() {
+        const terms = getTermsForSearchString(this._entry.get_text());
+        this._results.setTerms(terms);
+        if (terms.length > 0) {
+            this._setActive(true);
+            this._entry.set_secondary_icon(this._clearIcon);
+        } else {
+            this._entry.set_secondary_icon(null);
+            if (this._entry.text !== '')
+                return;
+            this._setActive(false);
+            if (!global.display.focus_window)
+                this.claimKeyboard();
+        }
+    }
+
+    _onEntryKeyPress(entry, event) {
+        const symbol = event.get_key_symbol();
+        if (symbol === Clutter.KEY_Escape) {
+            this.reset();
+            return Clutter.EVENT_STOP;
+        }
+        if (!this._active)
+            return Clutter.EVENT_PROPAGATE;
+
+        const rtl = entry.get_text_direction() === Clutter.TextDirection.RTL;
+        const arrowNext = rtl ? Clutter.KEY_Left : Clutter.KEY_Right;
+        const nextDirection = rtl ? St.DirectionType.LEFT : St.DirectionType.RIGHT;
+        if (symbol === Clutter.KEY_Tab) {
+            this._results.navigateFocus(St.DirectionType.TAB_FORWARD);
+            return Clutter.EVENT_STOP;
+        } else if (symbol === Clutter.KEY_ISO_Left_Tab) {
+            this._results.navigateFocus(St.DirectionType.TAB_BACKWARD);
+            return Clutter.EVENT_STOP;
+        } else if (symbol === Clutter.KEY_Down) {
+            this._results.navigateFocus(St.DirectionType.DOWN);
+            return Clutter.EVENT_STOP;
+        } else if (symbol === arrowNext && this._text.cursor_position === -1) {
+            this._results.navigateFocus(nextDirection);
+            return Clutter.EVENT_STOP;
+        } else if (symbol === Clutter.KEY_Return || symbol === Clutter.KEY_KP_Enter) {
+            this._results.activateDefault();
+            return Clutter.EVENT_STOP;
+        }
+        return Clutter.EVENT_PROPAGATE;
     }
 });
 
@@ -1024,6 +2138,7 @@ class LauncherMirror {
             mirror._addClone(this, monitorIndex, {
                 above: this._background,
                 sizeFrom: 'holder',
+                fadeWithOverview: true,
             });
         };
         this._patches.push(() => (ovProto._init = origInit));
@@ -1057,8 +2172,12 @@ class LauncherMirror {
      * @param {string} [opts.sizeFrom] - 'holder' when the container's layout
      *   allocates the holder (BinLayout); otherwise the container's own
      *   size is the reference box
+     * @param {boolean} [opts.fadeWithOverview] - fade out as the overview
+     *   opens, following its state (swipe gesture or Super key animation)
      */
-    _addClone(container, monitorIndex, {above = null, sizeFrom = 'container'} = {}) {
+    _addClone(container, monitorIndex, {
+        above = null, sizeFrom = 'container', fadeWithOverview = false,
+    } = {}) {
         const layer = this._getLayer(monitorIndex);
         const monitor = Main.layoutManager.monitors[monitorIndex];
         if (!layer || !monitor)
@@ -1098,10 +2217,24 @@ class LauncherMirror {
         ref.connectObject('notify::allocation', fit, holder);
         layer.connectObject('notify::allocation', fit, holder);
 
+        // The state goes from HIDDEN (0) to WINDOW_PICKER (1): fully shown
+        // at the start of the transition, where the clone must match the
+        // real launcher, and gone once the overview is open.
+        const adjustment = Main.overview._overview.controls._stateAdjustment;
+        if (fadeWithOverview) {
+            const fade = () => {
+                const progress = Math.min(1, Math.max(0, adjustment.value - ControlsState.HIDDEN));
+                clone.opacity = Math.round(255 * (1 - progress));
+            };
+            fade();
+            adjustment.connectObject('notify::value', fade, holder);
+        }
+
         holder.connect('destroy', () => {
             this._clones.delete(holder);
             layer.disconnectObject(holder);
             ref.disconnectObject(holder);
+            adjustment.disconnectObject(holder);
         });
         layer.connectObject('destroy', () => holder.destroy(), holder);
     }
@@ -1131,12 +2264,31 @@ export default class DesktopLauncherExtension extends Extension {
         // Panel/dock struts moved: fit the new work area.
         global.display.connectObject('workareas-changed',
             () => this._layers.forEach(l => l.relayout()), this);
-        // The Shell added a new wallpaper actor above us: move back on top.
+        // The Shell added a new wallpaper actor above us: move it below.
         this._bgGroup.connectObject('child-added',
             (_group, child) => {
-                if (!(child instanceof LauncherLayer))
+                if (child instanceof Meta.BackgroundActor)
                     this._queueRaise();
             }, this);
+        // A press anywhere on the desktop (wallpaper or launcher) gives it
+        // the keyboard, for type-to-search. Watched on the stage: Clutter
+        // only emits events on reactive actors, and the background group
+        // isn't one.
+        global.stage.connectObject('captured-event', (_stage, event) => {
+            const type = event.type();
+            if ((type === Clutter.EventType.BUTTON_PRESS ||
+                 type === Clutter.EventType.TOUCH_BEGIN) &&
+                this._bgGroup.contains(global.stage.get_event_actor(event)))
+                this._search.claimKeyboard();
+            return Clutter.EVENT_PROPAGATE;
+        }, this);
+
+        // Type-to-search lives on the primary monitor's launcher.
+        this._search = new DesktopSearch();
+        this._search.connectObject(
+            'notify::active', () => this._searchLayer?.setSearchActive(this._search.active),
+            'escape', () => this._layers.forEach(l => l.closeFolder()),
+            this);
 
         // Content changes.
         Shell.AppSystem.get_default().connectObject(
@@ -1156,11 +2308,12 @@ export default class DesktopLauncherExtension extends Extension {
         for (const key of ['show-favorites', 'show-section-titles'])
             this._settings.connectObject(`changed::${key}`, () => this._queueRebuild(), this);
         // A drag on one monitor's grid saves app-order; the layer that did
-        // the drag already shows it, other layers rebuild.
+        // the drag already shows it, other layers rebuild. Queued, since the
+        // write happens inside a drop and the dragged tile must survive it.
         this._settings.connectObject('changed::app-order', () => {
             const reset = this._settings.get_strv('app-order').length === 0;
-            this._layers.filter(l => reset || !l.matchesSavedOrder())
-                .forEach(l => l.rebuild());
+            if (reset || this._layers.some(l => !l.matchesSavedOrder()))
+                this._queueRebuild();
         }, this);
         for (const key of ['icon-size', 'show-labels', 'margin', 'max-width']) {
             this._settings.connectObject(`changed::${key}`, () => {
@@ -1177,6 +2330,8 @@ export default class DesktopLauncherExtension extends Extension {
         this._syncAppGridTakeover();
 
         this._createLayers();
+
+        this._search.enable();
 
         // Show the launcher inside the workspace-switch animation and the
         // overview's workspace previews too.
@@ -1195,6 +2350,7 @@ export default class DesktopLauncherExtension extends Extension {
     disable() {
         Main.layoutManager.disconnectObject(this);
         global.display.disconnectObject(this);
+        global.stage.disconnectObject(this);
         this._bgGroup?.disconnectObject(this);
         Shell.AppSystem.get_default().disconnectObject(this);
         AppFavorites.getAppFavorites().disconnectObject(this);
@@ -1215,6 +2371,8 @@ export default class DesktopLauncherExtension extends Extension {
 
         this._mirror?.disable();
         this._mirror = null;
+        this._search?.destroy();
+        this._search = null;
         this._destroyLayers();
         this._appGridTakeover?.disable();
         this._appGridTakeover = null;
@@ -1225,10 +2383,7 @@ export default class DesktopLauncherExtension extends Extension {
     _watchFolders() {
         this._unwatchFolders();
         for (const id of this._folderSettings.get_strv('folder-children')) {
-            const folder = new Gio.Settings({
-                schema_id: `${FOLDER_SCHEMA}.folder`,
-                path: `${this._folderSettings.path}folders/${id}/`,
-            });
+            const folder = getFolder(this._folderSettings, id);
             folder.connectObject('changed', () => this._queueRebuild(), this);
             this._watchedFolders.push(folder);
         }
@@ -1240,6 +2395,11 @@ export default class DesktopLauncherExtension extends Extension {
     }
 
     _destroyLayers() {
+        // The search outlives the layers (it carries its search providers).
+        for (const actor of [this._search, this._search?.keyCatcher])
+            actor?.get_parent()?.remove_child(actor);
+        this._search?.clear_constraints();
+        this._searchLayer = null;
         this._layers?.forEach(l => l.destroy());
         this._layers = [];
     }
@@ -1256,17 +2416,37 @@ export default class DesktopLauncherExtension extends Extension {
             : [primaryIndex];
 
         for (const index of indices) {
-            const layer = new LauncherLayer(index, this._settings, this._folderSettings);
+            const layer = new LauncherLayer(index, this._settings, this._folderSettings,
+                () => this._queueRebuild());
             this._bgGroup.add_child(layer);
             this._layers.push(layer);
+            if (index === primaryIndex) {
+                // The key catcher must be mapped with the launcher; the
+                // search itself covers the whole work area, unpadded, so it
+                // sits beside the layer and follows its box.
+                layer.add_child(this._search.keyCatcher);
+                this._bgGroup.add_child(this._search);
+                this._search.add_constraint(new Clutter.BindConstraint({
+                    source: layer,
+                    coordinate: Clutter.BindCoordinate.ALL,
+                }));
+                this._searchLayer = layer;
+            }
         }
         this._raise();
         this._mirror?.refreshOverview();
     }
 
+    /**
+     * Keep the wallpapers at the bottom of the background group. Only they
+     * are moved, so whatever sits above the layers (search, folders, and
+     * the blur Blur my Shell places right below those) stays in order.
+     */
     _raise() {
-        for (const layer of this._layers)
-            this._bgGroup.set_child_above_sibling(layer, null);
+        for (const child of this._bgGroup.get_children()) {
+            if (child instanceof Meta.BackgroundActor)
+                this._bgGroup.set_child_below_sibling(child, null);
+        }
     }
 
     _queueRaise() {
