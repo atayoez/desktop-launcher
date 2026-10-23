@@ -53,6 +53,7 @@ const GRID_SPACING = 12;   // row/column spacing of the grid
 const FOLDER_SCHEMA = 'org.gnome.desktop.app-folders';
 const FOLDER_SUBICON_FRACTION = 0.4;   // same as the Shell's app grid
 const SEARCH_FADE_TIME = 150;     // the grid fading out for search results
+const FOCUS_FADE_TIME = 250;      // the overview's animation time
 const FOLDER_DIALOG_ANIMATION_TIME = 200;   // as the overview's AppFolderDialog
 const DRAG_FADE_TIME = 150;
 
@@ -1344,6 +1345,7 @@ class LauncherLayer extends St.Widget {
         this._settings = settings;
         this._folderSettings = folderSettings;
         this._queueRebuild = queueRebuild;
+        this._faded = false;
         this._columns = 0;
         this._popup = null;
         this._rebuildPending = false;
@@ -1552,6 +1554,30 @@ class LauncherLayer extends St.Widget {
 
     closeFolder() {
         this._popup?.close();
+    }
+
+    /**
+     * Fade the icons out while an app has the focus. Faded, they are hidden
+     * too, so a click on the desktop can't launch anything unseen; it goes
+     * to the wallpaper and brings the desktop (and the icons) back.
+     */
+    setFaded(faded) {
+        if (this._faded === faded)
+            return;
+        this._faded = faded;
+        if (faded)
+            this.closeFolder();
+        else
+            this._content.show();
+        this._content.ease({
+            opacity: faded ? 0 : 255,
+            duration: FOCUS_FADE_TIME,
+            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete: () => {
+                if (this._faded)
+                    this._content.hide();
+            },
+        });
     }
 
     /** Type-to-search replaces the grid while it shows results. */
@@ -2278,6 +2304,7 @@ export default class DesktopLauncherExtension extends Extension {
         this._layers = [];
         this._raiseLaterId = 0;
         this._rebuildIdleId = 0;
+        this._focusSyncId = 0;
 
         this._bgGroup = Main.layoutManager._backgroundGroup;
 
@@ -2314,6 +2341,12 @@ export default class DesktopLauncherExtension extends Extension {
                 this._search.claimKeyboard();
             return Clutter.EVENT_PROPAGATE;
         }, this);
+
+        // The icons fade out while an app window has the focus and come
+        // back when the desktop does (no focused window, or the keyboard on
+        // the launcher after a click on the desktop).
+        global.display.connectObject('notify::focus-window', () => this._queueFocusSync(), this);
+        global.stage.connectObject('notify::key-focus', () => this._queueFocusSync(), this);
 
         // Type-to-search lives on the primary monitor's launcher.
         this._search = new DesktopSearch();
@@ -2398,6 +2431,10 @@ export default class DesktopLauncherExtension extends Extension {
             GLib.Source.remove(this._rebuildIdleId);
             this._rebuildIdleId = 0;
         }
+        if (this._focusSyncId) {
+            GLib.Source.remove(this._focusSyncId);
+            this._focusSyncId = 0;
+        }
 
         this._mirror?.disable();
         this._mirror = null;
@@ -2464,6 +2501,7 @@ export default class DesktopLauncherExtension extends Extension {
             }
         }
         this._raise();
+        this._syncFocusFade();
         this._mirror?.refreshOverview();
     }
 
@@ -2488,6 +2526,27 @@ export default class DesktopLauncherExtension extends Extension {
                 this._raise();
                 return GLib.SOURCE_REMOVE;
             });
+    }
+
+    /**
+     * Focus moves in steps (the old window loses it before the next one
+     * gets it), so decide once it has settled, or the icons would flash.
+     */
+    _queueFocusSync() {
+        if (this._focusSyncId)
+            return;
+        this._focusSyncId = GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+            this._focusSyncId = 0;
+            this._syncFocusFade();
+            return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    _syncFocusFade() {
+        const focus = global.stage.key_focus;
+        const onDesktop = !global.display.focus_window ||
+            (focus !== null && this._bgGroup.contains(focus));
+        this._layers.forEach(l => l.setFaded(!onDesktop));
     }
 
     _queueRebuild() {
