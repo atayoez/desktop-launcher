@@ -31,7 +31,7 @@ A GNOME Shell extension that draws your apps on the wallpaper, behind every wind
 | **Drag to reorder** | Press and hold, then drag. The grid keeps your order. |
 | **No duplicates with the dock** | Pinned and running apps are already in the dock, so they stay out of the grid and folders until unpinned or closed. |
 | **Replace GNOME's app grid** | Optional: the Show Apps button, in the GNOME dash or in Dash to Panel, and Super+A minimize every window with GNOME's animation to reveal the launcher. Press again and the windows come back. |
-| **Out of the way** | While an app window has the focus, the icons fade out like they do when the overview opens, and can't be clicked by accident. Click the desktop (or close or minimise the window) and they fade back in. |
+| **Out of the way** | While a monitor shows any open (not minimised) app window on the current workspace, its icons fade out like they do when the overview opens, and can't be clicked by accident. Minimise or close the windows, or switch to an empty workspace, and they fade back in; with the app grid replacement on, the Show Apps button and Super+A do that for you. |
 | **Always there** | The launcher stays visible while you swipe between workspaces, where GNOME otherwise paints its own copies of the wallpaper. Opening the overview, by swiping up or pressing Super, fades it out smoothly. |
 | **Theme-native** | Tiles reuse the Shell's own icon and menu classes, so they follow your Shell theme, accent colour and icon theme. Running apps get a dot. |
 
