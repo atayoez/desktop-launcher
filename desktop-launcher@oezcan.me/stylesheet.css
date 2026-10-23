@@ -1,57 +1,18 @@
 /* SPDX-FileCopyrightText: 2026 Atay Özcan <atay@oezcan.me>
    SPDX-License-Identifier: GPL-2.0-or-later */
 
-/* Desktop Launcher: the grid lives on the wallpaper, so everything gets a
-   soft shadow to stay readable on light and dark backgrounds. */
+/* Desktop Launcher: the Shell's own app grid on the wallpaper. Its theme
+   styles assume the overview's dark background, so the labels get a soft
+   shadow to stay readable on light and dark wallpapers; nothing else is
+   restyled. */
 
 .desktop-launcher-layer {
   /* padding is set from the "margin" setting at runtime */
 }
 
-/* Tiles reuse the Shell's .overview-tile (rounded hover/active background on
-   the tile itself). Only the tile gets a highlight; the inner .overview-icon
-   stays transparent, otherwise hover shows two nested rectangles. The
-   doubled class selector outranks the theme's own .overview-tile rules. */
-.desktop-launcher-tile .overview-icon {
-  color: white;
+.desktop-launcher-layer .overview-tile .overview-icon,
+.desktop-launcher-layer .app-folder .overview-icon {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
-  background-color: transparent;
-}
-
-.desktop-launcher-tile.overview-tile:hover,
-.desktop-launcher-tile.overview-tile:focus {
-  background-color: rgba(255, 255, 255, 0.15);
-}
-
-.desktop-launcher-tile.overview-tile:active {
-  background-color: rgba(255, 255, 255, 0.25);
-}
-
-/* Folder tiles: translucent instead of the theme's opaque dark square. */
-.desktop-launcher-tile.app-folder {
-  background-color: rgba(255, 255, 255, 0.18);
-}
-
-.desktop-launcher-tile.app-folder:hover,
-.desktop-launcher-tile.app-folder:focus {
-  background-color: rgba(255, 255, 255, 0.28);
-}
-
-.desktop-launcher-tile.app-folder:active {
-  background-color: rgba(255, 255, 255, 0.36);
-}
-
-/* The tile a dragged app would merge into (new folder / move into folder):
-   the theme's own :drop look, restated because the rules above outrank it. */
-.desktop-launcher-tile.overview-tile:drop,
-.desktop-launcher-tile.app-folder:drop {
-  background-color: st-transparentize(-st-accent-color, 0.8);
-  box-shadow: inset 0 0 0 2px st-transparentize(-st-accent-color, 0.2);
-}
-
-/* The theme's running dot, with a shadow for the wallpaper. */
-.desktop-launcher-tile .app-grid-running-dot {
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
 }
 
 /* Type-to-search: the overview's search entry and results, styled by the
