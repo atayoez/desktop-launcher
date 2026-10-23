@@ -300,9 +300,11 @@ function makeDragActor(tile, label, createIcon, extraClass = '') {
  */
 const AppTile = GObject.registerClass(
 class AppTile extends St.Button {
-    _init(app, {iconSize, showLabel, draggable = false}) {
+    _init(app, {iconSize, showLabel, draggable = false, inDialog = false}) {
+        // In a folder dialog the tile is a plain overview tile, styled by
+        // the theme's .app-folder-dialog rules rather than for the wallpaper.
         super._init({
-            style_class: 'desktop-launcher-tile overview-tile',
+            style_class: inDialog ? 'overview-tile' : 'desktop-launcher-tile overview-tile',
             button_mask: St.ButtonMask.ONE | St.ButtonMask.TWO,
             can_focus: true,
             reactive: true,
@@ -341,7 +343,7 @@ class AppTile extends St.Button {
 
         // Running indicator, same idea as the overview's app-grid dot.
         this._dot = new St.Widget({
-            style_class: 'desktop-launcher-running-dot',
+            style_class: inDialog ? 'app-grid-running-dot' : 'desktop-launcher-running-dot',
             x_expand: true,
             y_expand: true,
             x_align: Clutter.ActorAlign.CENTER,
@@ -567,35 +569,55 @@ const FolderPopup = GObject.registerClass({
         this._dragMonitor = null;
         this._popdownId = 0;
 
+        // The overview's AppFolderDialog structure and theme classes:
+        // container > .app-folder-dialog > .folder-name-container + grid.
+        // Only the dialog's fixed 720px size is overridden (stylesheet), so
+        // it fits the folder's apps.
         this._panel = new St.BoxLayout({
-            style_class: 'desktop-launcher-folder-popup',
+            style_class: 'app-folder-dialog desktop-launcher-folder-dialog',
             orientation: Clutter.Orientation.VERTICAL,
             reactive: true,
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.CENTER,
         });
-        this.add_child(this._panel);
+        this.add_child(new St.Bin({
+            style_class: 'app-folder-dialog-container',
+            child: this._panel,
+            x_expand: true,
+            y_expand: true,
+        }));
 
         this._header = new St.BoxLayout({
-            style_class: 'desktop-launcher-folder-header',
-            x_align: Clutter.ActorAlign.CENTER,
+            style_class: 'folder-name-container',
+            x_expand: true,
         });
         this._panel.add_child(this._header);
 
+        // Empty actor the size of the edit button, to centre the title.
+        const ghost = new Clutter.Actor();
+        this._header.add_child(ghost);
+
         this._title = new St.Label({
-            style_class: 'desktop-launcher-folder-title',
+            style_class: 'folder-name-label',
             text: folder.name,
+            x_expand: true,
+            x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.CENTER,
         });
         this._header.add_child(this._title);
 
         this._renameButton = new St.Button({
-            style_class: 'desktop-launcher-folder-rename',
-            child: new St.Icon({icon_name: 'document-edit-symbolic'}),
+            style_class: 'icon-button',
+            icon_name: 'document-edit-symbolic',
             accessible_name: _('Rename'),
             can_focus: true,
+            x_align: Clutter.ActorAlign.END,
             y_align: Clutter.ActorAlign.CENTER,
         });
+        ghost.add_constraint(new Clutter.BindConstraint({
+            source: this._renameButton,
+            coordinate: Clutter.BindCoordinate.SIZE,
+        }));
         this._renameButton.connect('clicked', () => {
             if (this._entry)
                 this._finishRename();
@@ -605,13 +627,14 @@ const FolderPopup = GObject.registerClass({
         this._header.add_child(this._renameButton);
 
         const scroll = new St.ScrollView({
+            style_class: 'desktop-launcher-folder-scroll',
             hscrollbar_policy: St.PolicyType.NEVER,
             vscrollbar_policy: St.PolicyType.AUTOMATIC,
         });
         this._panel.add_child(scroll);
 
         const tiles = folder.apps.map(app => {
-            const tile = new AppTile(app, {...tileParams, draggable: true});
+            const tile = new AppTile(app, {...tileParams, draggable: true, inDialog: true});
             tile.folderId = folder.id;
             tile.connect('clicked', () => this.close());
             return tile;
@@ -812,9 +835,11 @@ const FolderPopup = GObject.registerClass({
         if (this._entry || this._closing)
             return;
         this._entry = new St.Entry({
-            style_class: 'desktop-launcher-folder-entry',
+            style_class: 'folder-name-entry',
             text: this.folder.name,
             can_focus: true,
+            x_expand: true,
+            x_align: Clutter.ActorAlign.CENTER,
         });
         this._entry.clutter_text.connect('activate', () => this._finishRename());
         this._entry.clutter_text.connect('key-press-event', (_text, event) => {
@@ -825,7 +850,8 @@ const FolderPopup = GObject.registerClass({
             return Clutter.EVENT_STOP;
         });
         this._title.hide();
-        this._header.insert_child_at_index(this._entry, 0);
+        this._header.insert_child_above(this._entry, this._title);
+        this._renameButton.checked = true;
 
         this._grab = Main.pushModal(this, {actionMode: Shell.ActionMode.POPUP});
         this._entry.clutter_text.grab_key_focus();
@@ -846,6 +872,7 @@ const FolderPopup = GObject.registerClass({
         if (name)
             this._title.text = name;
         this._title.show();
+        this._renameButton.checked = false;
         this.emit('rename-finished', name);
     }
 

@@ -69,51 +69,21 @@
   margin-bottom: 4px;
 }
 
-/* Open folder: invisible click-catcher over the grid (a click outside the
-   panel closes the folder), centred panel. */
+/* Open folder: invisible click-catcher over the desktop (a click outside
+   the dialog closes the folder) holding the theme's own .app-folder-dialog,
+   as in the overview. Only its fixed 720x720 size is dropped so it fits the
+   folder's apps; the grid gets the room the overview's folder view has. */
 .desktop-launcher-folder-backdrop {
   background-color: transparent;
 }
 
-.desktop-launcher-folder-popup {
-  background-color: rgba(36, 36, 40, 0.88);
-  border-radius: 28px;
-  padding: 24px;
-  spacing: 12px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+.desktop-launcher-folder-dialog.app-folder-dialog {
+  width: auto;
+  height: auto;
 }
 
-.desktop-launcher-folder-header {
-  spacing: 6px;
-  padding-bottom: 6px;
-}
-
-.desktop-launcher-folder-title {
-  font-size: 1.3em;
-  font-weight: bold;
-  color: white;
-  text-align: center;
-}
-
-.desktop-launcher-folder-rename {
-  color: white;
-  padding: 6px;
-  border-radius: 99px;
-}
-
-.desktop-launcher-folder-rename StIcon {
-  icon-size: 16px;
-}
-
-.desktop-launcher-folder-rename:hover,
-.desktop-launcher-folder-rename:focus {
-  background-color: rgba(255, 255, 255, 0.15);
-}
-
-.desktop-launcher-folder-entry {
-  font-size: 1.3em;
-  font-weight: bold;
-  min-width: 240px;
+.desktop-launcher-folder-scroll {
+  padding: 24px 36px 36px 36px;
 }
 
 /* The icon copy that follows the pointer while dragging a tile. */
