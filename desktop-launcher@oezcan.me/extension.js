@@ -35,6 +35,7 @@ import {Extension, gettext as _} from 'resource:///org/gnome/shell/extensions/ex
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {ControlsState} from 'resource:///org/gnome/shell/ui/overviewControls.js';
 import {SHELL_KEYBINDINGS_SCHEMA} from 'resource:///org/gnome/shell/ui/windowManager.js';
+import * as AppDisplay from 'resource:///org/gnome/shell/ui/appDisplay.js';
 import * as AppFavorites from 'resource:///org/gnome/shell/ui/appFavorites.js';
 import {AppMenu} from 'resource:///org/gnome/shell/ui/appMenu.js';
 import * as BoxPointer from 'resource:///org/gnome/shell/ui/boxpointer.js';
@@ -1256,7 +1257,9 @@ const TileGrid = GObject.registerClass({
             },
         };
         DND.addDragMonitor(this._dragMonitor);
-        source.draggable.connectObject('drag-end', () => this._endDrag(), this);
+        // Our tiles expose .draggable; the Shell's AppIcon keeps _draggable.
+        (source.draggable ?? source._draggable).connectObject('drag-end',
+            () => this._endDrag(), this);
     }
 
     _endDrag() {
@@ -1267,7 +1270,7 @@ const TileGrid = GObject.registerClass({
             DND.removeDragMonitor(this._dragMonitor);
             this._dragMonitor = null;
         }
-        this._dragSource?.draggable.disconnectObject(this);
+        (this._dragSource?.draggable ?? this._dragSource?._draggable)?.disconnectObject(this);
         this._dragSource = null;
     }
 
@@ -1346,8 +1349,11 @@ class LauncherLayer extends St.Widget {
         this._queueRebuild = queueRebuild;
         this._columns = 0;
         this._popup = null;
+        this._folderDialog = null;
+        this._folderDrag = false;
         this._rebuildPending = false;
         this._appGrid = null;
+        this.connect('destroy', () => this._destroyFolderDialog());
 
         this._scroll = new St.ScrollView({
             style_class: 'desktop-launcher-scroll',
@@ -1407,11 +1413,14 @@ class LauncherLayer extends St.Widget {
 
     /** Recreate all tiles from the current app list and settings. */
     rebuild() {
-        // Don't throw away a name being typed; rebuild when editing ends.
-        if (this._popup?.renaming) {
+        // Don't throw away a name being typed, an open folder dialog (it
+        // zooms back into its tile) or the app being dragged out of one;
+        // rebuild when they are done.
+        if (this._popup?.renaming || this._folderDialog?.isOpen || this._folderDrag) {
             this._rebuildPending = true;
             return;
         }
+        this._destroyFolderDialog();
         // An open folder stays open across the rebuild.
         const openFolderId = this._popup && !this._popup.closing
             ? this._popup.folder.id : null;
@@ -1454,7 +1463,7 @@ class LauncherLayer extends St.Widget {
         let tiles = [
             ...folders.map(folder => {
                 const tile = new FolderTile(folder, dragParams);
-                tile.connect('open-folder', () => this._openFolder(folder, tileParams, {source: tile}));
+                tile.connect('open-folder', () => this._openFolderDialog(folder, tile));
                 return tile;
             }),
             ...gridApps.filter(app => !inFolders.has(app.get_id()))
@@ -1471,7 +1480,9 @@ class LauncherLayer extends St.Widget {
         // grid dropped on the middle of an app makes a folder, on a folder
         // goes in. Holding it over a folder also opens the folder.
         this._appGrid = new TileGrid(tiles, this._columns, {
-            acceptsExternal: source => source instanceof AppTile && source.folderId !== null,
+            acceptsExternal: source =>
+                (source instanceof AppTile && source.folderId !== null) ||
+                this._folderDialogFolderOf(source) !== null,
             canMerge: (source, target) => source instanceof AppTile &&
                 this._appGrid._tiles.includes(source) &&
                 (target instanceof AppTile || target instanceof FolderTile),
@@ -1480,16 +1491,17 @@ class LauncherLayer extends St.Widget {
             this._settings.set_strv('app-order', this._appGrid.getKeys());
         });
         this._appGrid.connect('external-drop', (_s, source, index) => {
-            const keys = this._appGrid.getKeys().filter(k => k !== source.key);
-            keys.splice(index, 0, source.key);
+            // Our folder tiles or the folder dialog's Shell AppIcons.
+            const key = source.key ?? source.id;
+            const keys = this._appGrid.getKeys().filter(k => k !== key);
+            keys.splice(index, 0, key);
             this._settings.set_strv('app-order', keys);
-            removeAppFromFolder(this._folderSettings, source.folderId, source.key);
+            removeAppFromFolder(this._folderSettings,
+                source.folderId ?? this._folderDialogFolderOf(source), key);
         });
         this._appGrid.connect('merge', (_s, source, target) => this._merge(source, target));
-        this._appGrid.connect('drop-target-held', (_s, target, source) => {
-            if (target instanceof FolderTile)
-                this._openFolder(target.folder, tileParams, {source: target, dragSource: source});
-        });
+        // No opening folders by holding an app over them: the Shell's folder
+        // dialog takes a modal grab, which would end the drag.
         this._content.add_child(this._appGrid);
 
         const openTile = tiles.find(t => t.key === `folder:${openFolderId}`);
@@ -1552,6 +1564,97 @@ class LauncherLayer extends St.Widget {
 
     closeFolder() {
         this._popup?.close();
+        if (this._folderDialog?.isOpen)
+            this._folderDialog.dialog.popdown();
+    }
+
+    /**
+     * Open a folder in the Shell's own AppFolderDialog, as the overview
+     * does: a FolderView of the folder's apps in the dialog, zooming out
+     * of the folder tile. Reordering, renaming, popping down when an app
+     * is dragged out, Escape and click-outside are all the Shell's code.
+     * The dialog only lives on the desktop instead of the overview.
+     */
+    _openFolderDialog(folder, source) {
+        if (this._folderDialog?.isOpen || !source)
+            return;
+        this._destroyFolderDialog();
+
+        const settings = getFolder(this._folderSettings, folder.id);
+        // FolderView asks its parent view for the installed apps, to match
+        // the folder's categories.
+        const appSystem = Shell.AppSystem.get_default();
+        const view = new AppDisplay.FolderView(settings, folder.id, {
+            getAppInfos: () => appSystem.get_installed().filter(info => info.should_show()),
+        });
+        // AppFolderDialog takes the folder icon's view and name.
+        source.view = view;
+        source.name = folder.name;
+        const dialog = new AppDisplay.AppFolderDialog(source, settings, {
+            selectApp: () => {},
+        });
+        dialog.add_style_class_name(BLUR_MY_SHELL_TARGET);
+        const entry = {dialog, view, folderId: folder.id, isOpen: false};
+        this._folderDialog = entry;
+
+        dialog.connect('open-state-changed', (_d, isOpen) => {
+            entry.isOpen = isOpen;
+            // The folder tile hides while open, as the overview's FolderIcon.
+            const duration = FOLDER_DIALOG_ANIMATION_TIME / 2;
+            source.ease({
+                opacity: isOpen ? 0 : 255,
+                duration,
+                delay: isOpen ? 0 : FOLDER_DIALOG_ANIMATION_TIME - duration,
+                mode: isOpen
+                    ? Clutter.AnimationMode.EASE_OUT_QUAD
+                    : Clutter.AnimationMode.EASE_IN_QUAD,
+            });
+            if (!isOpen)
+                this._runPendingRebuild();
+        });
+        // In the overview, launching an app hides the overview and with it
+        // the dialog; here the dialog closes itself.
+        appSystem.connectObject('app-state-changed', (_s, app) => {
+            if (entry.isOpen && app.state === Shell.AppState.STARTING)
+                dialog.popdown();
+        }, dialog);
+        global.display.connectObject('notify::focus-window', () => {
+            if (entry.isOpen && global.display.focus_window)
+                dialog.popdown();
+        }, dialog);
+        // An app dragged out of the dialog lives in it until the drop.
+        Main.overview.connectObject(
+            'item-drag-begin', (_o, item) => {
+                if (view.contains(item))
+                    this._folderDrag = true;
+            },
+            'item-drag-end', () => this._endFolderDrag(),
+            'item-drag-cancelled', () => this._endFolderDrag(),
+            dialog);
+
+        // Over the desktop like the launcher, on the primary monitor (the
+        // dialog constrains itself to it).
+        this.get_parent().add_child(dialog);
+        dialog.popup();
+    }
+
+    _endFolderDrag() {
+        if (!this._folderDrag)
+            return;
+        this._folderDrag = false;
+        this._runPendingRebuild();
+    }
+
+    _destroyFolderDialog() {
+        this._folderDialog?.dialog.destroy();
+        this._folderDialog = null;
+    }
+
+    /** The folder id of an AppIcon dragged out of the folder dialog, or null. */
+    _folderDialogFolderOf(source) {
+        const entry = this._folderDialog;
+        return entry && source instanceof AppDisplay.AppIcon && entry.view.contains(source)
+            ? entry.folderId : null;
     }
 
     /** Type-to-search replaces the grid while it shows results. */
