@@ -52,7 +52,8 @@ const GRID_SPACING = 12;   // row/column spacing of the grid
 
 const FOLDER_SCHEMA = 'org.gnome.desktop.app-folders';
 const FOLDER_SUBICON_FRACTION = 0.4;   // same as the Shell's app grid
-const FOLDER_ANIMATION_TIME = 150;
+const SEARCH_FADE_TIME = 150;     // the grid fading out for search results
+const FOLDER_DIALOG_ANIMATION_TIME = 200;   // as the overview's AppFolderDialog
 const DRAG_FADE_TIME = 150;
 
 // Drag and drop follows the overview's app grid (appDisplay.js, iconGrid.js):
@@ -252,7 +253,7 @@ function tileSide(iconSize, showLabel) {
 /**
  * Drag-source behaviour shared by app and folder tiles. Like the overview's
  * scaleAndFade(), the tile shrinks away and leaves an empty slot while a
- * copy of its icon follows the pointer (Shell DND); sections listen on
+ * copy of its icon follows the pointer (Shell DND); grids listen on
  * tile.draggable for drag-begin / drag-end to reorder and persist.
  *
  * @param {St.Button} tile
@@ -281,18 +282,6 @@ function makeTileDraggable(tile) {
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         });
     });
-}
-
-/** The actor that follows the pointer: a fresh copy of the tile's icon. */
-function makeDragActor(tile, label, createIcon, extraClass = '') {
-    const icon = new IconGrid.BaseIcon(label, {
-        createIcon,
-        showLabel: tile.icon.label !== null,
-        setSizeManually: true,
-    });
-    icon.setIconSize(tile.icon.iconSize);
-    icon.style_class = `desktop-launcher-drag-actor overview-icon ${extraClass}`;
-    return icon;
 }
 
 /**
@@ -341,13 +330,17 @@ class AppTile extends St.Button {
         const side = tileSide(iconSize, showLabel);
         this.set_size(side, side);
 
-        // Running indicator, same idea as the overview's app-grid dot.
+        // Running indicator: the overview's app-grid dot, placed by the
+        // theme's offset-y as AppIcon._updateDotStyle does.
         this._dot = new St.Widget({
-            style_class: inDialog ? 'app-grid-running-dot' : 'desktop-launcher-running-dot',
+            style_class: 'app-grid-running-dot',
             x_expand: true,
             y_expand: true,
             x_align: Clutter.ActorAlign.CENTER,
             y_align: Clutter.ActorAlign.END,
+        });
+        this._dot.connect('style-changed', () => {
+            this._dot.translation_y = this._dot.get_theme_node().get_length('offset-y');
         });
         this._box.add_child(this._dot);
         this.app.connectObject('notify::state', () => this._updateDot(), this);
@@ -383,17 +376,18 @@ class AppTile extends St.Button {
         this._menu = null;
     }
 
+    // As the overview's AppIcon: the bare icon follows the pointer.
     getDragActor() {
-        return makeDragActor(this, this.app.get_name(),
-            size => this.app.create_icon_texture(size));
+        return this.app.create_icon_texture(
+            Main.overview.dash?.iconSize ?? this.icon.iconSize);
     }
 
     getDragActorSource() {
-        return this;
+        return this.icon.icon;
     }
 
     _updateDot() {
-        this._dot.visible = this.app.state === Shell.AppState.RUNNING;
+        this._dot.visible = this.app.state !== Shell.AppState.STOPPED;
     }
 
     /** An app hovered by another app shrinks to show it becomes a folder. */
@@ -488,9 +482,16 @@ const FolderTile = GObject.registerClass({
             makeTileDraggable(this);
     }
 
+    // As the overview's FolderIcon: a copy of the tile follows the pointer.
     getDragActor() {
-        return makeDragActor(this, this.folder.name,
-            size => this._createFolderIcon(size), 'app-folder');
+        const icon = new IconGrid.BaseIcon(this.folder.name, {
+            createIcon: size => this._createFolderIcon(size),
+            showLabel: this.icon.label !== null,
+            setSizeManually: true,
+        });
+        icon.setIconSize(this.icon.iconSize);
+        icon.style_class = this.style_class;
+        return icon;
     }
 
     getDragActorSource() {
@@ -552,7 +553,7 @@ const FolderPopup = GObject.registerClass({
         'app-removed': {param_types: [GObject.TYPE_JSOBJECT]},
     },
 }, class FolderPopup extends St.Widget {
-    _init(folder, tileParams, columns, {animate = true, dragSource = null} = {}) {
+    _init(folder, tileParams, columns, {source = null, animate = true, dragSource = null} = {}) {
         super._init({
             style_class: `desktop-launcher-folder-backdrop ${BLUR_MY_SHELL_TARGET}`,
             layout_manager: new Clutter.BinLayout(),
@@ -564,6 +565,10 @@ const FolderPopup = GObject.registerClass({
         this.folder = folder;
         this._closing = false;
         this._hiddenForDrag = false;
+        // The folder tile it opened from: hidden while open, and where the
+        // dialog zooms from and back to.
+        this._source = source;
+        source?.connectObject('destroy', () => (this._source = null), this);
         this._grab = null;
         this._entry = null;
         this._dragMonitor = null;
@@ -641,9 +646,8 @@ const FolderPopup = GObject.registerClass({
         });
         const accepts = source => source === dragSource;
         const slots = tiles.length + (dragSource ? 1 : 0);
-        const grid = new Section(null, tiles, false, Math.min(columns, slots), {
+        const grid = new TileGrid(tiles, Math.min(columns, slots), {
             acceptsExternal: accepts,
-            externalPlaceholder: true,
         });
         grid.connect('reordered', () => this.emit('reordered', grid.getKeys()));
         grid.connect('external-drop', (_s, source, index) => this._addApp(source, index));
@@ -678,7 +682,7 @@ const FolderPopup = GObject.registerClass({
             },
         };
 
-        // Connected after the Section's own drag handlers, which still
+        // Connected after the grid's own drag handlers, which still
         // touch the grid on drag-end.
         for (const tile of tiles) {
             tile.draggable.connect('drag-begin', () => this._trackDrag(tile, false));
@@ -717,21 +721,91 @@ const FolderPopup = GObject.registerClass({
             return Clutter.EVENT_STOP;
         });
 
+        this.connect('destroy', () => {
+            if (this._source)
+                this._source.opacity = 255;
+        });
+        this._setSourceHidden(true, animate);
         if (!animate)
             return;
+
+        // Zoom in from the folder tile once the dialog has its place, as
+        // AppFolderDialog._zoomAndFadeIn.
         this.opacity = 0;
-        this._panel.set_pivot_point(0.5, 0.5);
-        this._panel.set_scale(0.9, 0.9);
+        this._panel.connectObject('notify::allocation', () => {
+            if (this._panel.width === 0)
+                return;
+            this._panel.disconnectObject(this);
+            this._zoomAndFadeIn();
+        }, this);
+    }
+
+    /** Hide or show the folder tile, timed as the overview's FolderIcon. */
+    _setSourceHidden(hidden, animate = true) {
+        if (!this._source)
+            return;
+        const duration = FOLDER_DIALOG_ANIMATION_TIME / 2;
+        this._source.ease({
+            opacity: hidden ? 0 : 255,
+            duration: animate ? duration : 0,
+            delay: hidden || !animate ? 0 : FOLDER_DIALOG_ANIMATION_TIME - duration,
+            mode: hidden
+                ? Clutter.AnimationMode.EASE_OUT_QUAD
+                : Clutter.AnimationMode.EASE_IN_QUAD,
+        });
+    }
+
+    /** Panel transform that puts it over the folder tile, or null. */
+    _sourceTransform() {
+        if (!this._source?.mapped || this._panel.width === 0)
+            return null;
+        const [sx, sy] = this._source.get_transformed_position();
+        const [px, py] = this._panel.get_transformed_position();
+        return {
+            translation_x: sx - (px - this._panel.translation_x),
+            translation_y: sy - (py - this._panel.translation_y),
+            scale_x: this._source.width / this._panel.width,
+            scale_y: this._source.height / this._panel.height,
+        };
+    }
+
+    _zoomAndFadeIn() {
+        this._panel.set_pivot_point(0, 0);
+        const from = this._sourceTransform();
+        if (from)
+            this._panel.set({...from, opacity: 0});
         this.ease({
             opacity: 255,
-            duration: FOLDER_ANIMATION_TIME,
+            duration: FOLDER_DIALOG_ANIMATION_TIME,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
         });
         this._panel.ease({
+            translation_x: 0,
+            translation_y: 0,
             scale_x: 1,
             scale_y: 1,
-            duration: FOLDER_ANIMATION_TIME,
+            opacity: 255,
+            duration: FOLDER_DIALOG_ANIMATION_TIME,
+            mode: Clutter.AnimationMode.EASE_OUT_EXPO,
+        });
+    }
+
+    /** AppFolderDialog._zoomAndFadeOut: back into the folder tile. */
+    _zoomAndFadeOut(onComplete) {
+        this._panel.set_pivot_point(0, 0);
+        const to = this._sourceTransform();
+        this._setSourceHidden(false);
+        this._panel.ease({
+            ...to ?? {},
+            opacity: 0,
+            duration: FOLDER_DIALOG_ANIMATION_TIME,
+            mode: Clutter.AnimationMode.EASE_OUT_EXPO,
+        });
+        this.ease({
+            opacity: 0,
+            duration: FOLDER_DIALOG_ANIMATION_TIME,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+            onComplete,
         });
     }
 
@@ -817,18 +891,7 @@ const FolderPopup = GObject.registerClass({
         this._closing = true;
         this._hiddenForDrag = true;
         this.reactive = false;
-        this._panel.ease({
-            scale_x: 0.9,
-            scale_y: 0.9,
-            duration: FOLDER_ANIMATION_TIME,
-            mode: Clutter.AnimationMode.EASE_IN_QUAD,
-        });
-        this.ease({
-            opacity: 0,
-            duration: FOLDER_ANIMATION_TIME,
-            mode: Clutter.AnimationMode.EASE_IN_QUAD,
-            onComplete: () => this.hide(),
-        });
+        this._zoomAndFadeOut(() => this.hide());
     }
 
     _startRename() {
@@ -882,26 +945,15 @@ const FolderPopup = GObject.registerClass({
         this._stopTrackingDrag();
         this._closing = true;
         this.reactive = false;
-        this._panel.ease({
-            scale_x: 0.9,
-            scale_y: 0.9,
-            duration: FOLDER_ANIMATION_TIME,
-            mode: Clutter.AnimationMode.EASE_IN_QUAD,
-        });
-        this.ease({
-            opacity: 0,
-            duration: FOLDER_ANIMATION_TIME,
-            mode: Clutter.AnimationMode.EASE_IN_QUAD,
-            onComplete: () => {
-                this.emit('closed');
-                this.destroy();
-            },
+        this._zoomAndFadeOut(() => {
+            this.emit('closed');
+            this.destroy();
         });
     }
 });
 
 /**
- * A titled section (e.g. "Favourites") holding a grid of tiles.
+ * A grid of tiles: the launcher's apps and folders, or an open folder's apps.
  *
  * The column count is passed in rather than derived from the allocation:
  * Clutter.FlowLayout cannot report a reliable height inside a scroll view,
@@ -912,23 +964,21 @@ const FolderPopup = GObject.registerClass({
  * moves the dragged tile there after DELAYED_MOVE_TIMEOUT; its empty slot
  * travels with it. A drop emits 'reordered'. Tiles from elsewhere that
  * acceptsExternal(source) allows drop in with 'external-drop' (source,
- * index); with externalPlaceholder an empty slot shows where, moving the
- * same way. Dropping on the middle of a tile that canMerge(source, tile)
+ * index); an empty slot shows where, moving the same way. Dropping on the middle of a tile that canMerge(source, tile)
  * allows emits 'merge' instead; holding over a folder tile there emits
  * 'drop-target-held'.
  */
-const Section = GObject.registerClass({
+const TileGrid = GObject.registerClass({
     Signals: {
         'reordered': {},
         'external-drop': {param_types: [GObject.TYPE_JSOBJECT, GObject.TYPE_INT]},
         'merge': {param_types: [GObject.TYPE_JSOBJECT, GObject.TYPE_JSOBJECT]},
         'drop-target-held': {param_types: [GObject.TYPE_JSOBJECT, GObject.TYPE_JSOBJECT]},
     },
-}, class Section extends St.BoxLayout {
-    _init(title, tiles, showTitle, columns, {
+}, class TileGrid extends St.BoxLayout {
+    _init(tiles, columns, {
         acceptsExternal = () => false,
         canMerge = () => false,
-        externalPlaceholder = false,
     } = {}) {
         super._init({
             orientation: Clutter.Orientation.VERTICAL,
@@ -939,7 +989,6 @@ const Section = GObject.registerClass({
         this._tiles = [];
         this._acceptsExternal = acceptsExternal;
         this._canMerge = canMerge;
-        this._externalPlaceholder = externalPlaceholder;
         this._orderBeforeDrag = null;
         this._placeholder = null;
         this._delayedMove = null;
@@ -949,13 +998,6 @@ const Section = GObject.registerClass({
         this._dragSource = null;
         this._dragMonitor = null;
         this.connect('destroy', () => this._endDrag());
-
-        if (showTitle && title) {
-            this.add_child(new St.Label({
-                style_class: 'desktop-launcher-section-title',
-                text: title,
-            }));
-        }
 
         this._layout = new Clutter.GridLayout({
             orientation: Clutter.Orientation.HORIZONTAL,
@@ -1195,7 +1237,7 @@ const Section = GObject.registerClass({
 
     /**
      * DND has no "drag left" notification for targets: a drag monitor
-     * stops hovering and pending moves once the pointer leaves the section,
+     * stops hovering and pending moves once the pointer leaves the grid,
      * and the source's drag-end cleans up (also when a drag is cancelled).
      */
     _beginDrag(source) {
@@ -1241,8 +1283,6 @@ const Section = GObject.registerClass({
             this._removeDelayedMove();
             return DND.DragMotionResult.MOVE_DROP;
         }
-        if (!own && !this._externalPlaceholder)
-            return DND.DragMotionResult.COPY_DROP;
         if (!own)
             this._ensurePlaceholder();
         this._maybeMoveItem(own ? source : this._placeholder, x, y);
@@ -1307,7 +1347,7 @@ class LauncherLayer extends St.Widget {
         this._columns = 0;
         this._popup = null;
         this._rebuildPending = false;
-        this._appsSection = null;
+        this._appGrid = null;
 
         this._scroll = new St.ScrollView({
             style_class: 'desktop-launcher-scroll',
@@ -1380,17 +1420,13 @@ class LauncherLayer extends St.Widget {
         if (!this._popup?.closing)
             this._popup?.destroy();
         this._popup = null;
-        this._appsSection = null;
+        this._appGrid = null;
         this._content.destroy_all_children();
 
         const tileParams = {
             iconSize: this._settings.get_int('icon-size'),
             showLabel: this._settings.get_boolean('show-labels'),
         };
-        // Section titles only make sense when there is more than one
-        // section; a lone "All Apps" heading is noise.
-        let showTitles = this._settings.get_boolean('show-section-titles');
-
         const appSystem = Shell.AppSystem.get_default();
         const parental = ParentalControlsManager.getDefault();
 
@@ -1400,38 +1436,11 @@ class LauncherLayer extends St.Widget {
             .filter(app => app !== null)
             .sort((a, b) => a.get_name().localeCompare(b.get_name()));
 
-        let favorites = [];
-        if (this._settings.get_boolean('show-favorites')) {
-            favorites = AppFavorites.getAppFavorites().getFavorites()
-                .filter(app => parental.shouldShowApp(app.get_app_info()));
-        }
-        if (favorites.length === 0)
-            showTitles = false;
-
         const dragParams = {...tileParams, draggable: true};
         const appFavorites = AppFavorites.getAppFavorites();
 
-        if (favorites.length > 0) {
-            const tiles = favorites.map(app => new AppTile(app, dragParams));
-            const section = new Section(_('Favourites'), tiles, showTitles, this._columns, {
-                acceptsExternal: source => source instanceof AppTile &&
-                    !appFavorites.isFavorite(source.key),
-            });
-            section.connect('reordered', () => {
-                // Favourites order lives in GNOME's favorite-apps list.
-                section.getKeys().forEach((id, pos) => {
-                    if (appFavorites.getFavorites()[pos]?.get_id() !== id)
-                        appFavorites.moveFavoriteToPos(id, pos);
-                });
-            });
-            section.connect('external-drop', (_s, source, index) => {
-                appFavorites.addFavoriteAtPos(source.key, index);
-            });
-            this._content.add_child(section);
-        }
-
         // Whatever the dock already shows (pinned favourites and running
-        // apps) stays out of All Apps and folders.
+        // apps) stays out of the grid and folders.
         const inDock = new Set([
             ...appFavorites.getFavorites().map(a => a.get_id()),
             ...appSystem.get_running().map(a => a.get_id()),
@@ -1445,7 +1454,7 @@ class LauncherLayer extends St.Widget {
         let tiles = [
             ...folders.map(folder => {
                 const tile = new FolderTile(folder, dragParams);
-                tile.connect('open-folder', () => this._openFolder(folder, tileParams));
+                tile.connect('open-folder', () => this._openFolder(folder, tileParams, {source: tile}));
                 return tile;
             }),
             ...gridApps.filter(app => !inFolders.has(app.get_id()))
@@ -1458,39 +1467,38 @@ class LauncherLayer extends St.Widget {
             tiles = [...known, ...tiles.filter(t => !order.has(t.key))];
         }
         // As in the overview: apps dragged out of an open folder drop
-        // anywhere on All Apps (an empty slot shows where); an All Apps app
-        // dropped on the middle of an app makes a folder, on a folder goes
-        // in. Holding it over a folder also opens the folder.
-        this._appsSection = new Section(_('All Apps'), tiles, showTitles, this._columns, {
+        // anywhere on the grid (an empty slot shows where); an app from the
+        // grid dropped on the middle of an app makes a folder, on a folder
+        // goes in. Holding it over a folder also opens the folder.
+        this._appGrid = new TileGrid(tiles, this._columns, {
             acceptsExternal: source => source instanceof AppTile && source.folderId !== null,
-            externalPlaceholder: true,
             canMerge: (source, target) => source instanceof AppTile &&
-                this._appsSection._tiles.includes(source) &&
+                this._appGrid._tiles.includes(source) &&
                 (target instanceof AppTile || target instanceof FolderTile),
         });
-        this._appsSection.connect('reordered', () => {
-            this._settings.set_strv('app-order', this._appsSection.getKeys());
+        this._appGrid.connect('reordered', () => {
+            this._settings.set_strv('app-order', this._appGrid.getKeys());
         });
-        this._appsSection.connect('external-drop', (_s, source, index) => {
-            const keys = this._appsSection.getKeys().filter(k => k !== source.key);
+        this._appGrid.connect('external-drop', (_s, source, index) => {
+            const keys = this._appGrid.getKeys().filter(k => k !== source.key);
             keys.splice(index, 0, source.key);
             this._settings.set_strv('app-order', keys);
             removeAppFromFolder(this._folderSettings, source.folderId, source.key);
         });
-        this._appsSection.connect('merge', (_s, source, target) => this._merge(source, target));
-        this._appsSection.connect('drop-target-held', (_s, target, source) => {
+        this._appGrid.connect('merge', (_s, source, target) => this._merge(source, target));
+        this._appGrid.connect('drop-target-held', (_s, target, source) => {
             if (target instanceof FolderTile)
-                this._openFolder(target.folder, tileParams, {dragSource: source});
+                this._openFolder(target.folder, tileParams, {source: target, dragSource: source});
         });
-        this._content.add_child(this._appsSection);
+        this._content.add_child(this._appGrid);
 
-        const openFolder = folders.find(f => f.id === openFolderId);
-        if (openFolder)
-            this._openFolder(openFolder, tileParams, {animate: false});
+        const openTile = tiles.find(t => t.key === `folder:${openFolderId}`);
+        if (openTile)
+            this._openFolder(openTile.folder, tileParams, {source: openTile, animate: false});
     }
 
     /**
-     * Drop of an app tile on the middle of another tile in All Apps: into
+     * Drop of an app tile on the middle of another tile in the grid: into
      * the folder, or a new folder of both apps where the target app was.
      * Settings writes only; the rebuild they trigger runs once the drag has
      * finished.
@@ -1503,7 +1511,7 @@ class LauncherLayer extends St.Widget {
         if (source.folderId)
             removeAppFromFolder(this._folderSettings, source.folderId, source.key);
         const id = createFolder(this._folderSettings, [target.app, source.app]);
-        const keys = this._appsSection.getKeys()
+        const keys = this._appGrid.getKeys()
             .map(k => (k === target.key ? `folder:${id}` : k));
         this._settings.set_strv('app-order', keys.filter(k => k !== source.key));
     }
@@ -1515,12 +1523,12 @@ class LauncherLayer extends St.Widget {
             removeAppFromFolder(this._folderSettings, source.folderId, source.key);
         addAppToFolder(this._folderSettings, folderId, source.key);
         this._settings.set_strv('app-order',
-            this._appsSection.getKeys().filter(k => k !== source.key));
+            this._appGrid.getKeys().filter(k => k !== source.key));
     }
 
-    /** An app dragged out of a folder and dropped beside it: last in All Apps. */
+    /** An app dragged out of a folder and dropped beside it: last in the grid. */
     _takeOutOfFolder(source) {
-        const keys = this._appsSection.getKeys().filter(k => k !== source.key);
+        const keys = this._appGrid.getKeys().filter(k => k !== source.key);
         this._settings.set_strv('app-order', [...keys, source.key]);
         removeAppFromFolder(this._folderSettings, source.folderId, source.key);
     }
@@ -1552,7 +1560,7 @@ class LauncherLayer extends St.Widget {
             this._popup?.close();
         this._scroll.ease({
             opacity: active ? 0 : 255,
-            duration: FOLDER_ANIMATION_TIME,
+            duration: SEARCH_FADE_TIME,
             mode: Clutter.AnimationMode.EASE_OUT_QUAD,
             onComplete: () => (this._scroll.visible = !active),
         });
@@ -1560,23 +1568,20 @@ class LauncherLayer extends St.Widget {
             this._scroll.visible = true;
     }
 
-    /** True when the All Apps grid already shows the saved order. */
+    /** True when the grid already shows the saved order. */
     matchesSavedOrder() {
         const saved = this._settings.get_strv('app-order');
-        const keys = this._appsSection?.getKeys() ?? [];
+        const keys = this._appGrid?.getKeys() ?? [];
         const known = keys.filter(k => saved.includes(k));
         return known.length === saved.filter(k => keys.includes(k)).length &&
             known.every((k, i) => k === saved.filter(x => keys.includes(x))[i]);
     }
 
-    _openFolder(folder, tileParams, {animate = true, dragSource = null} = {}) {
-        // A popup hidden for a drag out of it stays alive (it holds the
-        // dragged tile) until that drag ends; another folder may open
-        // meanwhile.
-        if (this._popup && !(dragSource && this._popup.closing))
+    _openFolder(folder, tileParams, {source = null, animate = true, dragSource = null} = {}) {
+        if (this._popup)
             return;
         const columns = Math.max(1, Math.min(this._columns - 2, 6));
-        const popup = new FolderPopup(folder, tileParams, columns, {animate, dragSource});
+        const popup = new FolderPopup(folder, tileParams, columns, {source, animate, dragSource});
         this._popup = popup;
         popup.connect('closed', () => {
             if (this._popup === popup)
@@ -2332,8 +2337,6 @@ export default class DesktopLauncherExtension extends Extension {
             () => this._queueRebuild(), this);
 
         // Settings.
-        for (const key of ['show-favorites', 'show-section-titles'])
-            this._settings.connectObject(`changed::${key}`, () => this._queueRebuild(), this);
         // A drag on one monitor's grid saves app-order; the layer that did
         // the drag already shows it, other layers rebuild. Queued, since the
         // write happens inside a drop and the dragged tile must survive it.

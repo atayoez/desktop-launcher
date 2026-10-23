@@ -12,15 +12,6 @@
       <default>true</default>
       <summary>Show app names</summary>
     </key>
-    <key name="show-favorites" type="b">
-      <default>true</default>
-      <summary>Show a favourites section</summary>
-      <description>Shows the dash favourites as a separate row above all apps.</description>
-    </key>
-    <key name="show-section-titles" type="b">
-      <default>true</default>
-      <summary>Show section titles</summary>
-    </key>
     <key name="replace-app-grid" type="b">
       <default>false</default>
       <summary>Replace GNOME's app grid with the desktop</summary>

@@ -8,18 +8,6 @@
   /* padding is set from the "margin" setting at runtime */
 }
 
-.desktop-launcher-content {
-  spacing: 18px;
-}
-
-.desktop-launcher-section-title {
-  font-weight: bold;
-  font-size: 1.1em;
-  color: white;
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
-  padding: 0 12px 6px 12px;
-}
-
 /* Tiles reuse the Shell's .overview-tile (rounded hover/active background on
    the tile itself). Only the tile gets a highlight; the inner .overview-icon
    stays transparent, otherwise hover shows two nested rectangles. The
@@ -53,30 +41,22 @@
   background-color: rgba(255, 255, 255, 0.36);
 }
 
-/* The tile a dragged app would merge into (new folder / move into folder);
-   :drop is the pseudo class the overview's app grid uses for this. */
+/* The tile a dragged app would merge into (new folder / move into folder):
+   the theme's own :drop look, restated because the rules above outrank it. */
 .desktop-launcher-tile.overview-tile:drop,
 .desktop-launcher-tile.app-folder:drop {
-  background-color: rgba(255, 255, 255, 0.4);
+  background-color: st-transparentize(-st-accent-color, 0.8);
+  box-shadow: inset 0 0 0 2px st-transparentize(-st-accent-color, 0.2);
 }
 
-.desktop-launcher-running-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 3px;
-  background-color: white;
+/* The theme's running dot, with a shadow for the wallpaper. */
+.desktop-launcher-tile .app-grid-running-dot {
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.7);
-  margin-bottom: 4px;
 }
 
-/* Open folder: invisible click-catcher over the desktop (a click outside
-   the dialog closes the folder) holding the theme's own .app-folder-dialog,
-   as in the overview. Only its fixed 720x720 size is dropped so it fits the
-   folder's apps; the grid gets the room the overview's folder view has. */
-.desktop-launcher-folder-backdrop {
-  background-color: transparent;
-}
-
+/* Open folder: the theme's own .app-folder-dialog, as in the overview. Only
+   its fixed 720x720 size is dropped so it fits the folder's apps; the grid
+   gets the room the overview's folder view has. */
 .desktop-launcher-folder-dialog.app-folder-dialog {
   width: auto;
   height: auto;
@@ -84,12 +64,6 @@
 
 .desktop-launcher-folder-scroll {
   padding: 24px 36px 36px 36px;
-}
-
-/* The icon copy that follows the pointer while dragging a tile. */
-.desktop-launcher-drag-actor {
-  color: white;
-  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.8);
 }
 
 /* Type-to-search: the overview's search entry and results, styled by the

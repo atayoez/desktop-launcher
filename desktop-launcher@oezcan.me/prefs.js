@@ -33,19 +33,9 @@ export default class DesktopLauncherPreferences extends ExtensionPreferences {
             title: _('Show app names'),
         }));
 
-        look.add(this._switchRow(settings, 'show-section-titles', {
-            title: _('Show section titles'),
-            subtitle: _('“Favourites” and “All Apps” headings'),
-        }));
-
         // --- Content --------------------------------------------------------
         const content = new Adw.PreferencesGroup({title: _('Content')});
         page.add(content);
-
-        content.add(this._switchRow(settings, 'show-favorites', {
-            title: _('Favourites row'),
-            subtitle: _('Show the dash favourites as a separate row above all apps'),
-        }));
 
         content.add(this._switchRow(settings, 'replace-app-grid', {
             title: _('Replace GNOME’s app grid'),
