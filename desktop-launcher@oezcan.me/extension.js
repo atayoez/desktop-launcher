@@ -1534,8 +1534,9 @@ const DesktopSearch = GObject.registerClass({
  *  - toggleDesktop() minimizes every window on the current workspace using
  *    the Shell's own minimize animation, revealing the launcher; a second
  *    call restores the windows it minimized;
- *  - the overview state is clamped so shift-overview-up and the swipe
- *    gesture stop at the window picker.
+ *  - shifting up from the window picker (pressing Super twice, Super+Up)
+ *    calls toggleDesktop() too, and the overview state is clamped so the
+ *    swipe gesture stops at the window picker.
  * Everything is restored in disable().
  */
 class AppGridTakeover {
@@ -1582,10 +1583,17 @@ class AppGridTakeover {
         });
         this._patch(overview, 'showApps', () => () => this.toggleDesktop());
         this._patch(controls, '_toggleAppsPage', () => () => this.toggleDesktop());
+        // Shifting up past the window picker would open the app grid: a
+        // second Super press while the overview is still opening, or
+        // shift-overview-up (Super+Up) in it. Show the desktop instead,
+        // judged by where the overview is heading, not where it is.
         this._patch(controls, '_shiftState', orig => direction => {
+            const {finalState} = adjustment.getStateTransitionParams();
             if (direction === Meta.MotionDirection.UP &&
-                adjustment.value >= ControlsState.WINDOW_PICKER)
+                finalState >= ControlsState.WINDOW_PICKER) {
+                this.toggleDesktop();
                 return;
+            }
             orig(direction);
         });
         // Swipe gesture: offer only hidden <-> window picker as snap points.
