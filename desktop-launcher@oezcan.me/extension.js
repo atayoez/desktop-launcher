@@ -970,22 +970,26 @@ class LauncherMirror {
         this._clones.add(holder);
         const ref = sizeFrom === 'holder' ? holder : container;
 
-        // The overview squeezes the work area into a box of a different
-        // aspect and crops the wallpaper; icons must not be distorted, so
-        // scale uniformly to fit and centre. At full size (switch animation,
-        // start of the overview transition) this is an exact 1:1 mapping.
+        // The switch animation's group is the whole monitor, so the layer
+        // sits at its offset in it. An overview workspace's box is the work
+        // area, which the layer covers exactly: the box starts out the work
+        // area's size and shrinks into a preview of a different aspect, so
+        // the layer is scaled uniformly (icons must not be distorted) and
+        // centred. At full size both are exact 1:1 mappings, so the copy
+        // lines up with the real launcher as the transitions start and end.
+        const area = sizeFrom === 'holder' ? layer : monitor;
         const fit = () => {
             if (!holder.get_parent() || !layer.get_parent())
                 return;
             const [w, h] = [ref.width, ref.height];
             if (w <= 0 || h <= 0)
                 return;
-            const s = Math.min(w / monitor.width, h / monitor.height);
+            const s = Math.min(w / area.width, h / area.height);
             clone.set_size(layer.width, layer.height);
             clone.set_scale(s, s);
             clone.set_position(
-                (w - monitor.width * s) / 2 + (layer.x - monitor.x) * s,
-                (h - monitor.height * s) / 2 + (layer.y - monitor.y) * s);
+                (w - area.width * s) / 2 + (layer.x - area.x) * s,
+                (h - area.height * s) / 2 + (layer.y - area.y) * s);
         };
         fit();
         ref.connectObject('notify::allocation', fit, holder);
