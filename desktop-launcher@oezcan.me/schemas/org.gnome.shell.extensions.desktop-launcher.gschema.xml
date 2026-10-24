@@ -8,10 +8,6 @@
       <summary>Icon size</summary>
       <description>Size of the app icons on the desktop, in pixels.</description>
     </key>
-    <key name="show-labels" type="b">
-      <default>true</default>
-      <summary>Show app names</summary>
-    </key>
     <key name="replace-app-grid" type="b">
       <default>false</default>
       <summary>Replace GNOME's app grid with the desktop</summary>

@@ -29,10 +29,6 @@ export default class DesktopLauncherPreferences extends ExtensionPreferences {
             lower: 32, upper: 160, step: 8,
         }));
 
-        look.add(this._switchRow(settings, 'show-labels', {
-            title: _('Show app names'),
-        }));
-
         // --- Content --------------------------------------------------------
         const content = new Adw.PreferencesGroup({title: _('Content')});
         page.add(content);
